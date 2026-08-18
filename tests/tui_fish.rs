@@ -229,8 +229,13 @@ fn fish_script_has_metadata_hooks_dedicated_ai_read_and_mode_bindings() {
     assert!(!script.contains("--resume --one-turn"));
     assert!(script.contains("--fish-ai"));
     assert!(script.contains("A_FISH_AI_PROMPT"));
-    assert!(script.contains("[AI] "));
+    assert!(script.contains("a> "));
+    assert!(!script.contains("[AI] "));
     assert!(script.contains("read --local --line"));
+    assert!(script.contains("--right-prompt"));
+    assert!(script.contains("once · tab"));
+    assert!(script.contains("multi · tab"));
+    assert!(script.contains("__a_handle_tab"));
     assert!(script.contains("__a_ai_prompt_active"));
     assert!(!script.contains("--shell"));
     assert!(script.contains("bind -M default \\cg __a_ai_prompt"));
@@ -301,48 +306,68 @@ async fn new_fish_has_immediate_ai_prompt_without_shell_completion_and_invokes_a
     tmux_key(&socket, session, "Enter").await;
     wait_for_pane(&socket, session, "[1]#").await;
     tmux_key(&socket, session, "C-g").await;
-    let ai_prompt = wait_for_pane(&socket, session, "[AI]").await;
-    assert!(ai_prompt.contains("[AI]"), "{ai_prompt:?}");
+    let ai_prompt = wait_for_last_line(&socket, session, |line| {
+        line.contains("a>") && line.contains("once · tab")
+    })
+    .await;
+    assert!(ai_prompt.contains("a>"), "{ai_prompt:?}");
     tmux_type(&socket, session, "git che").await;
     tmux_key(&socket, session, "Tab").await;
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     let no_completion = tmux_capture(&socket, session).await;
     assert!(!no_completion.contains("checkout"), "{no_completion:?}");
+    assert!(
+        last_visible_line(&no_completion).contains("multi · tab"),
+        "{no_completion:?}"
+    );
     let colored = tmux_capture_escaped(&socket, session).await;
     let ai_line = colored
         .lines()
         .find(|line| line.contains("git che"))
         .expect("AI input line missing from colored capture");
     let input = &ai_line[ai_line.find("git che").unwrap()..];
-    assert!(
-        !input.contains("\x1b["),
-        "AI input was syntax-highlighted: {ai_line:?}"
-    );
+    let input = input.split_once("\x1b[").map_or(input, |(input, _)| input);
+    assert_eq!(input.trim_end(), "git che", "{ai_line:?}");
     tmux_key(&socket, session, "C-g").await;
     let normal_mode = wait_for_last_line(&socket, session, |line| line.contains("[1]#")).await;
     assert!(
         last_visible_line(&normal_mode).contains("git che"),
         "{normal_mode:?}"
     );
-    assert!(!normal_mode.contains("[AI] git che"), "{normal_mode:?}");
+    assert!(!normal_mode.contains("a> git che"), "{normal_mode:?}");
 
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     tmux_key(&socket, session, "C-c").await;
     wait_for_prompt(&socket, session).await;
     tmux_key(&socket, session, "C-g").await;
-    wait_for_pane(&socket, session, "[AI]").await;
+    wait_for_last_line(&socket, session, |line| line.contains("a>")).await;
     tmux_type(&socket, session, "cancel me").await;
     tmux_key(&socket, session, "C-c").await;
     let interrupted = wait_for_last_line(&socket, session, |line| line.contains("[1]#")).await;
-    assert!(interrupted.contains("[AI] cancel me"), "{interrupted:?}");
+    assert!(interrupted.contains("a> cancel me"), "{interrupted:?}");
 
     tmux_key(&socket, session, "C-g").await;
-    wait_for_pane(&socket, session, "[AI]").await;
-    tmux_type(&socket, session, "echo ok").await;
+    wait_for_last_line(&socket, session, |line| {
+        line.contains("a>") && line.contains("once · tab")
+    })
+    .await;
+    tmux_key(&socket, session, "Tab").await;
+    wait_for_last_line(&socket, session, |line| line.contains("multi · tab")).await;
+    tmux_type(&socket, session, "first turn").await;
     tmux_key(&socket, session, "Enter").await;
-    let pane = wait_for_pane(&socket, session, "agent invoked").await;
+    wait_for_pane_count(&socket, session, "agent invoked", 1).await;
+    wait_for_last_line(&socket, session, |line| {
+        line.contains("a>") && line.contains("multi · tab")
+    })
+    .await;
+    tmux_type(&socket, session, "echo ok").await;
+    tmux_key(&socket, session, "Tab").await;
+    wait_for_last_line(&socket, session, |line| line.contains("once · tab")).await;
+    tmux_key(&socket, session, "Enter").await;
+    let pane = wait_for_pane_count(&socket, session, "agent invoked", 2).await;
     let calls = std::fs::read_to_string(&log).unwrap();
     assert!(calls.contains("--fish-ai|--fish-session-key|"), "{calls:?}");
+    assert!(calls.contains("--one-turn|prompt=first turn|"), "{calls:?}");
     assert!(calls.contains("--one-turn|prompt=echo ok|"), "{calls:?}");
     assert!(!pane.contains("a --fish-ai"), "{pane:?}");
     assert!(pane.contains("agent invoked"), "{pane:?}");
@@ -417,6 +442,20 @@ async fn wait_for_pane(socket: &str, session: &str, needle: &str) -> String {
     }
     panic!(
         "tmux pane did not contain {needle:?}: {:?}",
+        tmux_capture(socket, session).await
+    );
+}
+
+async fn wait_for_pane_count(socket: &str, session: &str, needle: &str, expected: usize) -> String {
+    for _ in 0..80 {
+        let pane = tmux_capture(socket, session).await;
+        if pane.matches(needle).count() >= expected {
+            return pane;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!(
+        "tmux pane did not contain {expected} occurrences of {needle:?}: {:?}",
         tmux_capture(socket, session).await
     );
 }

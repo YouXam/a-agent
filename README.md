@@ -165,11 +165,12 @@ Install Fish hooks and the AI-mode binding:
 a --install-fish
 ```
 
-Restart Fish, or source `~/.config/fish/conf.d/a.fish`. `Ctrl+G` opens a
-dedicated `[AI]` input prompt. It deliberately does not enable Fish `--shell`
-mode, so shell syntax highlighting, autosuggestions, and tab completion do not
-apply. Enter invokes the agent without echoing an internal command line, then
-returns to the Fish prompt.
+Restart Fish, or source `~/.config/fish/conf.d/a.fish`. `Ctrl+G` opens the
+dedicated `a> ` input prompt. It deliberately does not enable Fish `--shell`
+mode, so shell syntax highlighting and autosuggestions do not apply. The right
+prompt shows `once · tab` by default; press `Tab` to switch to `multi · tab`.
+Once mode returns to Fish after one response. Multi mode keeps showing `a> `
+after each response until it is switched back to once or cancelled.
 Press `Ctrl+G` again to restore the current text to the normal Fish editor on
 the same line. Press `Ctrl+C` to cancel the AI input line and open a fresh Fish
 prompt.

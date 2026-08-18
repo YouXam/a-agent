@@ -383,9 +383,7 @@ api_key = "secret"
     assert_eq!(String::from_utf8_lossy(&alternate.stdout).trim(), "0");
     assert_eq!(screen.matches("hi").count(), 1, "{screen:?}");
     assert!(
-        screen
-            .lines()
-            .any(|line| line.starts_with("› hi") || line.starts_with("> hi")),
+        screen.lines().any(|line| line.starts_with("a> hi")),
         "{screen:?}"
     );
     assert!(
@@ -519,7 +517,7 @@ api_key = "secret"
     tmux_send_key(&socket, session, "Enter").await;
     wait_for_fish_prompt(&socket, session).await;
     tmux_send_hex(&socket, session, "07").await;
-    wait_for_tmux_text(&socket, session, "[AI]").await;
+    wait_for_tmux_text(&socket, session, "once · tab").await;
     tmux_send_text(&socket, session, "fix previous failure").await;
     tmux_send_key(&socket, session, "Enter").await;
     let pane = wait_for_tmux_text(&socket, session, "history received").await;
@@ -906,7 +904,7 @@ async fn wait_for_agent_prompt(socket: &str, session: &str) {
             .lines()
             .rev()
             .find(|line| !line.trim().is_empty())
-            .is_some_and(|line| matches!(line.trim(), ">" | "›"))
+            .is_some_and(|line| line.trim() == "a>")
         {
             return;
         }

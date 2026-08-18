@@ -118,7 +118,7 @@ impl InputEditor {
     }
 
     pub fn read_action(&mut self) -> io::Result<InputAction> {
-        let prompt = ("> ", "\x1b[1;36m› \x1b[0m");
+        let prompt = ("a> ", "\x1b[1;36ma> \x1b[0m");
         let result = if let Some((left, right)) = self.pending_initial.take() {
             self.editor.readline_with_initial(&prompt, (&left, &right))
         } else {
