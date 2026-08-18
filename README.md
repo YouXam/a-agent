@@ -26,24 +26,38 @@ The installed binary is named `a`.
 
 On the first agent run, `a` creates `~/.config/a/config.toml` from
 [`config.example.toml`](config.example.toml) and prints its path. The default
-Responses settings are active; optional endpoints, provider alternatives,
-headers, and request fields remain commented out until needed.
+Responses settings are active. Configuration uses named provider and model
+profiles; the legacy singular `[provider]` table is not supported.
 
-OpenAI Responses:
+One provider can serve multiple independently configured models:
 
 ```toml
-[provider]
+default_model = "codex"
+
+[providers.openai]
 type = "responses"
 base_url = "https://api.openai.com/v1"
-model = "gpt-5.6"
 api_key_env = "OPENAI_API_KEY"
+
+[models.codex]
+provider = "openai"
+model = "gpt-5.6"
+effort = "medium"
+efforts = ["low", "medium", "high", "xhigh", "max"]
+context_window = 1050000
+
+[models.fast]
+provider = "openai"
+model = "gpt-5.6"
+effort = "low"
+efforts = ["none", "low", "medium"]
 ```
 
 An API key can also be stored directly. A non-empty `api_key` takes precedence
 over `api_key_env`:
 
 ```toml
-[provider]
+[providers.openai]
 api_key = "sk-..."
 ```
 
@@ -53,11 +67,16 @@ and out of version control; environment variables remain the safer default.
 Anthropic Messages:
 
 ```toml
-[provider]
+[providers.anthropic]
 type = "anthropic"
 base_url = "https://api.anthropic.com"
-model = "your-claude-model"
 api_key_env = "ANTHROPIC_API_KEY"
+
+[models.claude]
+provider = "anthropic"
+model = "your-claude-model"
+effort = "high"
+efforts = ["low", "medium", "high", "max"]
 ```
 
 Anthropic's Rust SDK appends `/v1`; configure an origin rather than a `/v1`
@@ -66,22 +85,31 @@ endpoint. OpenAI protocol base URLs should normally include `/v1`.
 OpenAI-compatible Chat Completions:
 
 ```toml
-[provider]
+[providers.gateway]
 type = "chatcompletion"
 base_url = "https://gateway.example/v1"
-model = "provider-model-id"
 api_key_env = "GATEWAY_API_KEY"
 
-[provider.headers]
+[providers.gateway.headers]
 X-Tenant = "acme"
 
-[provider.request]
+[providers.gateway.request]
 service_tier = "priority"
+
+[models.gateway]
+provider = "gateway"
+model = "provider-model-id"
+effort = "medium"
+efforts = ["low", "medium", "high"]
 ```
 
-`base_url`, model, API-key environment variable, custom headers, and extra
-request fields are configurable. No provider discovery or capability probe is
-performed. Only the configured provider is initialized.
+Provider profiles own endpoints and authentication. Model profiles own the
+model ID, effort choices, context window, token limit, and optional
+header/request overrides.
+When set, `context_window` must be greater than the model's effective
+`max_tokens` value.
+No provider discovery or capability probe is performed. Only the selected
+provider is initialized.
 
 Project-local `.a/config.toml` values override the global config.
 
@@ -103,6 +131,38 @@ a --session a_SESSION_ID "continue"
 cycles. Target files are sent as paths; their contents are read only if the
 model calls `read`. Piped stdin is bounded and keeps the tail, which is useful
 for compiler and test logs.
+
+Interactive `a` defaults to multi-turn mode. `Tab` switches the right prompt
+between `multi · tab` and `once · tab`; once mode exits after the current
+response. Input history is stored in SQLite and shared across interactive
+a-agent sessions. Fish keeps its own existing history behavior.
+
+Interactive commands:
+
+```text
+/model [profile]
+/effort [level]
+/status
+/clear
+/compact
+/resume [session-id]
+/help
+```
+
+Without an argument, `/model` and `/effort` open an arrow-key selector. Model
+profile and effort changes are persisted with the session and restored by
+resume. `/resume` opens a current-directory session selector when no ID is
+given. In Fish, selecting a session also rebinds that Fish process so later
+`Ctrl+G` turns continue the selected conversation. `/compact` immediately
+summarizes the active branch; automatic compaction uses the same path.
+
+When a model profile sets `context_window`, automatic compaction triggers near
+`context_window - max_tokens`. Context usage is anchored to the latest valid
+token count returned by the provider. OpenAI cached input is normalized into
+separate cache-read/cache-write fields; `total_tokens` is preferred when the
+provider returns it. Only messages added after the usage anchor use a small
+characters-per-token estimate. Compaction does not add a token-count API
+request to each turn, and compaction summary requests do not expose tools.
 
 ## Context
 
@@ -131,12 +191,14 @@ normal synchronous mode, foreign keys, and semantic write boundaries.
 An interrupted turn records an internal notice so a later resume does not
 silently continue the cancelled task.
 
-In interactive mode, press `Esc` twice to select a previous user checkpoint.
-Rewind moves the session HEAD; it does not delete the old branch.
+In interactive mode, press `Esc` to select a previous user checkpoint. A
+second `Esc` triggers it immediately instead of waiting for the terminal's
+500 ms escape-sequence timeout. Rewind moves the session HEAD; it does not
+delete the old branch.
 
 Default controls:
 
-- `Esc Esc`: rewind picker
+- `Esc` / `Esc Esc`: rewind picker
 - `Ctrl+O`: toggle reasoning visibility
 - `Esc` or `Ctrl+C` during a turn: cancel the active turn
 - `Ctrl+C` at the prompt: exit
@@ -156,8 +218,10 @@ fall back to labeled input/output blocks. Configure display limits with
 `ui.tool_output_max_lines`.
 The transient parallel-tool panel keeps the latest
 `ui.tool_live_output_lines` lines per running tool.
-A transient `thinking` spinner is shown while each model response is waiting
-for its first reasoning, text, or tool-call event.
+A transient spinner remains below the currently streamed reasoning or assistant
+line throughout model generation. Completed lines are appended to scrollback
+immediately; only the unfinished line is redrawn. The spinner disappears when
+generation completes and never enters scrollback.
 
 ## Fish
 
@@ -189,10 +253,10 @@ context.
 
 ## Security
 
-`read` and `apply_patch` are restricted to the startup cwd, including symlink
-resolution checks. `bash` is intentionally a normal shell running as the
-current user; it is not sandboxed. API keys are read from the configured
-environment variable and are not persisted in SQLite.
+`read`, `apply_patch`, and `bash` can access paths outside the cwd and run with
+the current user's permissions; none is sandboxed. API keys are read from the
+selected provider profile or its configured environment variable and are never
+persisted in SQLite.
 
 ## Validate
 

@@ -71,15 +71,20 @@ impl ChatCompletionProvider {
                 Role::System => {}
             }
         }
-        let tools = tool_definitions()
-            .into_iter()
-            .map(|tool| serde_json::json!({"type":"function","function":tool}))
-            .collect();
+        let tools = if request.include_tools {
+            tool_definitions()
+                .into_iter()
+                .map(|tool| serde_json::json!({"type":"function","function":tool}))
+                .collect()
+        } else {
+            Vec::new()
+        };
         let mut body = serde_json::Map::new();
         merge_request_fields(&mut body, &self.config);
         body.entry("stream_options")
             .or_insert_with(|| serde_json::json!({"include_usage":true}));
         body.insert("model".into(), Value::String(self.config.model.clone()));
+        body.insert("max_tokens".into(), Value::from(self.config.max_tokens));
         body.insert("messages".into(), Value::Array(messages));
         body.insert("tools".into(), Value::Array(tools));
         body.insert("stream".into(), Value::Bool(true));
@@ -126,13 +131,7 @@ struct ChatLive {
 impl ChatLive {
     fn emit(&mut self, value: &Value, sink: &EventSink) {
         if let Some(raw) = value.get("usage") {
-            sink.emit(StreamEvent::Usage(Usage {
-                input_tokens: raw.get("prompt_tokens").and_then(Value::as_u64),
-                output_tokens: raw.get("completion_tokens").and_then(Value::as_u64),
-                cached_tokens: raw
-                    .pointer("/prompt_tokens_details/cached_tokens")
-                    .and_then(Value::as_u64),
-            }));
+            sink.emit(StreamEvent::Usage(normalize_usage(raw)));
         }
         let Some(delta) = value.pointer("/choices/0/delta") else {
             return;
@@ -213,13 +212,7 @@ pub fn normalize_events(values: Vec<Value>) -> Result<(ModelTurn, Vec<StreamEven
             anyhow::bail!("provider error: {error}");
         }
         if let Some(raw) = value.get("usage") {
-            usage = Some(Usage {
-                input_tokens: raw.get("prompt_tokens").and_then(Value::as_u64),
-                output_tokens: raw.get("completion_tokens").and_then(Value::as_u64),
-                cached_tokens: raw
-                    .pointer("/prompt_tokens_details/cached_tokens")
-                    .and_then(Value::as_u64),
-            });
+            usage = Some(normalize_usage(raw));
         }
         let Some(delta) = value.pointer("/choices/0/delta") else {
             continue;
@@ -298,4 +291,27 @@ pub fn normalize_events(values: Vec<Value>) -> Result<(ModelTurn, Vec<StreamEven
         },
         events,
     ))
+}
+
+fn normalize_usage(raw: &Value) -> Usage {
+    let cached_tokens = raw
+        .pointer("/prompt_tokens_details/cached_tokens")
+        .and_then(Value::as_u64)
+        .or_else(|| raw.get("prompt_cache_hit_tokens").and_then(Value::as_u64))
+        .or_else(|| raw.get("cached_tokens").and_then(Value::as_u64));
+    let cache_write_tokens = raw
+        .pointer("/prompt_tokens_details/cache_write_tokens")
+        .and_then(Value::as_u64);
+    Usage {
+        input_tokens: raw
+            .get("prompt_tokens")
+            .and_then(Value::as_u64)
+            .map(|input| {
+                input.saturating_sub(cached_tokens.unwrap_or(0) + cache_write_tokens.unwrap_or(0))
+            }),
+        output_tokens: raw.get("completion_tokens").and_then(Value::as_u64),
+        cached_tokens,
+        cache_write_tokens,
+        total_tokens: raw.get("total_tokens").and_then(Value::as_u64),
+    }
 }

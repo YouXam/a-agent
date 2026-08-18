@@ -69,15 +69,19 @@ impl AnthropicProvider {
                 messages.push(serde_json::json!({"role":role,"content":content}));
             }
         }
-        let tools = tool_definitions()
-            .into_iter()
-            .map(|mut tool| {
-                let object = tool.as_object_mut().expect("tool definition object");
-                let parameters = object.remove("parameters").expect("parameters");
-                object.insert("input_schema".into(), parameters);
-                tool
-            })
-            .collect();
+        let tools = if request.include_tools {
+            tool_definitions()
+                .into_iter()
+                .map(|mut tool| {
+                    let object = tool.as_object_mut().expect("tool definition object");
+                    let parameters = object.remove("parameters").expect("parameters");
+                    object.insert("input_schema".into(), parameters);
+                    tool
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let mut body = serde_json::Map::new();
         merge_request_fields(&mut body, &self.config);
         body.insert("model".into(), Value::String(self.config.model.clone()));
@@ -215,6 +219,9 @@ pub fn normalize_events(values: Vec<Value>) -> Result<(ModelTurn, Vec<StreamEven
                 let raw = &value["message"]["usage"];
                 usage.input_tokens = raw.get("input_tokens").and_then(Value::as_u64);
                 usage.cached_tokens = raw.get("cache_read_input_tokens").and_then(Value::as_u64);
+                usage.cache_write_tokens = raw
+                    .get("cache_creation_input_tokens")
+                    .and_then(Value::as_u64);
                 has_usage = true;
             }
             "content_block_start" => {
@@ -320,6 +327,15 @@ pub fn normalize_events(values: Vec<Value>) -> Result<(ModelTurn, Vec<StreamEven
         }
     }
     let usage = has_usage.then_some(usage);
+    let usage = usage.map(|mut usage| {
+        usage.total_tokens = Some(
+            usage.input_tokens.unwrap_or(0)
+                + usage.output_tokens.unwrap_or(0)
+                + usage.cached_tokens.unwrap_or(0)
+                + usage.cache_write_tokens.unwrap_or(0),
+        );
+        usage
+    });
     if let Some(usage) = usage {
         events.push(StreamEvent::Usage(usage));
     }

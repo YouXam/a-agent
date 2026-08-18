@@ -10,7 +10,7 @@ use futures_util::StreamExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::Agent;
-use crate::config::{Config, ProviderKind};
+use crate::config::{Config, ModelSelection};
 use crate::context::{
     ContextInput, build_system_prompt, discover_agents_for_targets, discover_skills,
 };
@@ -19,7 +19,7 @@ use crate::model::ContentBlock;
 use crate::provider::create_provider;
 use crate::session::{NewSession, SessionStore, ShellHistoryItem, default_database_path};
 use crate::tools::runner::{CoreToolExecutor, ToolRunner};
-use crate::tui::{InlineRenderer, InputAction, InputEditor, RenderLimits};
+use crate::tui::{InlineRenderer, InputAction, InputEditor, InputMode, RenderLimits};
 
 use super::{CliArgs, args};
 
@@ -75,7 +75,7 @@ pub async fn run() -> Result<i32> {
         && let Some(path) = Config::ensure_user_config(&home)?
     {
         eprintln!("Created config at {}", path.display());
-        eprintln!("Set OPENAI_API_KEY or edit the provider section before use.");
+        eprintln!("Set OPENAI_API_KEY or edit the provider profiles before use.");
     }
     let config = Config::load_from(&cwd, &home)?;
     timing.mark("config");
@@ -105,7 +105,8 @@ pub async fn run() -> Result<i32> {
     let mut store = SessionStore::open(&database_path)?;
     timing.mark("sqlite_open");
     let cwd_text = cwd.to_string_lossy().into_owned();
-    let session = resolve_session(&mut store, &args, &cwd_text, &config)?;
+    let default_selection = config.resolve_model(None, None)?;
+    let mut session = resolve_session(&mut store, &args, &cwd_text, &default_selection)?;
     timing.mark("session_lookup");
     let shell_history = store.recent_shell_history(
         &cwd_text,
@@ -113,12 +114,12 @@ pub async fn run() -> Result<i32> {
         config.context.shell_history_count,
     )?;
     append_shell_context(&mut system_prompt, &shell_history);
-    let mut provider_config = config.provider.clone();
-    if args.resume || args.fish_session_key.is_some() {
-        provider_config.kind = ProviderKind::parse(&session.provider_type)?;
-        provider_config.model = session.model.clone();
-    }
-    let provider = create_provider(provider_config)?;
+    let mut selection = config.resolve_session_model(
+        session.model_profile.as_deref(),
+        &session.provider_type,
+        &session.model,
+        session.effort.as_deref(),
+    )?;
     let executor = Arc::new(CoreToolExecutor::new(
         cwd,
         config.context.read_max_lines,
@@ -127,14 +128,14 @@ pub async fn run() -> Result<i32> {
     ));
     let tools = Arc::new(ToolRunner::new(executor, config.tools.max_parallel));
     let store = Arc::new(Mutex::new(store));
-    let agent = Agent::new(
-        provider,
-        tools,
+    let mut agent = build_agent(
+        &selection,
+        tools.clone(),
         store.clone(),
-        session.id.clone(),
-        system_prompt,
+        &session.id,
+        &system_prompt,
         config.session.max_agent_cycles,
-    );
+    )?;
     let renderer = InlineRenderer::stdout_with_limits(
         config.ui.show_reasoning,
         RenderLimits {
@@ -145,18 +146,66 @@ pub async fn run() -> Result<i32> {
         },
     )?;
     let mut input = InputEditor::with_reasoning_toggle(&config.ui.reasoning_toggle)?;
+    if !args.fish_ai {
+        let history = store
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session store lock poisoned"))?
+            .recent_input_history(config.session.input_history_limit)?;
+        input.add_history_entries(&history)?;
+    }
     timing.mark("request_build");
     timing.print();
 
     if let Some(prompt) = args.prompt.as_deref() {
-        if args.fish_ai {
-            renderer.begin_turn()?;
-        } else {
-            renderer.render_user(prompt)?;
-        }
-        let contextual = contextual_prompt(prompt, stdin_context.as_deref());
-        if run_turn(&agent, &renderer, &contextual).await? && args.one_turn {
-            return Ok(130);
+        let slash_action = handle_slash_command(
+            prompt, &config, &mut input, &renderer, &store, &session, &selection,
+        )?;
+        match slash_action {
+            SlashAction::SwitchModel(new_selection) => {
+                switch_model_selection(&mut session, &mut selection, new_selection, &store)?;
+                agent = build_agent(
+                    &selection,
+                    tools.clone(),
+                    store.clone(),
+                    &session.id,
+                    &system_prompt,
+                    config.session.max_agent_cycles,
+                )?;
+            }
+            SlashAction::Compact => {
+                run_compaction(&agent, &renderer).await?;
+            }
+            SlashAction::Resume(resumed) => {
+                resume_session(
+                    &mut session,
+                    &mut selection,
+                    resumed,
+                    &config,
+                    &store,
+                    args.fish_session_key.as_deref(),
+                )?;
+                agent = build_agent(
+                    &selection,
+                    tools.clone(),
+                    store.clone(),
+                    &session.id,
+                    &system_prompt,
+                    config.session.max_agent_cycles,
+                )?;
+                renderer.render_status(&format!("resumed session {}", session.id))?;
+            }
+            SlashAction::Handled => {}
+            SlashAction::NotCommand => {
+                if args.fish_ai {
+                    renderer.begin_turn()?;
+                } else {
+                    renderer.render_user(prompt)?;
+                }
+                let contextual = contextual_prompt(prompt, stdin_context.as_deref());
+                if run_turn(&agent, &renderer, &contextual).await? && args.one_turn {
+                    return Ok(130);
+                }
+            }
         }
         if args.one_turn {
             return Ok(0);
@@ -167,12 +216,72 @@ pub async fn run() -> Result<i32> {
 
     loop {
         match input.read_action()? {
-            InputAction::Submit(prompt) if !prompt.trim().is_empty() => {
-                renderer.begin_turn()?;
-                let contextual = contextual_prompt(&prompt, None);
-                run_turn(&agent, &renderer, &contextual).await?;
+            InputAction::Submit(prompt, mode) if !prompt.trim().is_empty() => {
+                {
+                    let store = store
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("session store lock poisoned"))?;
+                    store.record_input_history(&prompt)?;
+                    store.prune_input_history(config.session.input_history_limit)?;
+                }
+                let slash_action = handle_slash_command(
+                    &prompt, &config, &mut input, &renderer, &store, &session, &selection,
+                )?;
+                match slash_action {
+                    SlashAction::SwitchModel(new_selection) => {
+                        switch_model_selection(
+                            &mut session,
+                            &mut selection,
+                            new_selection,
+                            &store,
+                        )?;
+                        agent = build_agent(
+                            &selection,
+                            tools.clone(),
+                            store.clone(),
+                            &session.id,
+                            &system_prompt,
+                            config.session.max_agent_cycles,
+                        )?;
+                    }
+                    SlashAction::Compact => {
+                        run_compaction(&agent, &renderer).await?;
+                    }
+                    SlashAction::Resume(resumed) => {
+                        resume_session(
+                            &mut session,
+                            &mut selection,
+                            resumed,
+                            &config,
+                            &store,
+                            args.fish_session_key.as_deref(),
+                        )?;
+                        agent = build_agent(
+                            &selection,
+                            tools.clone(),
+                            store.clone(),
+                            &session.id,
+                            &system_prompt,
+                            config.session.max_agent_cycles,
+                        )?;
+                        renderer.render_status(&format!("resumed session {}", session.id))?;
+                    }
+                    SlashAction::Handled => {}
+                    SlashAction::NotCommand => {
+                        renderer.begin_turn()?;
+                        let contextual = contextual_prompt(&prompt, None);
+                        let cancelled = run_turn(&agent, &renderer, &contextual).await?;
+                        if mode == InputMode::Once {
+                            return Ok(if cancelled { 130 } else { 0 });
+                        }
+                        continue;
+                    }
+                }
+                if mode == InputMode::Once {
+                    return Ok(0);
+                }
             }
-            InputAction::Submit(_) => {}
+            InputAction::Submit(_, _) => {}
             InputAction::ToggleReasoning => {
                 renderer.toggle_reasoning()?;
             }
@@ -251,6 +360,49 @@ async fn run_turn(agent: &Agent, renderer: &InlineRenderer, prompt: &str) -> Res
     Ok(true)
 }
 
+async fn run_compaction(agent: &Agent, renderer: &InlineRenderer) -> Result<bool> {
+    let cancel = CancellationToken::new();
+    let operation = agent.compact(renderer.event_sink(), cancel.clone());
+    tokio::pin!(operation);
+    let raw_mode = RawModeGuard::enable_if_terminal()?;
+    let mut events = raw_mode.as_ref().map(|_| EventStream::new());
+    let result = if let Some(events) = &mut events {
+        tokio::select! {
+            result = &mut operation => Some(result?),
+            signal = tokio::signal::ctrl_c() => {
+                signal?;
+                None
+            }
+            key = wait_for_turn_interrupt(events) => {
+                key?;
+                None
+            }
+        }
+    } else {
+        tokio::select! {
+            result = &mut operation => Some(result?),
+            signal = tokio::signal::ctrl_c() => {
+                signal?;
+                None
+            }
+        }
+    };
+    if let Some(compacted) = result {
+        renderer.render_status(if compacted {
+            "conversation compacted"
+        } else {
+            "no conversation to compact"
+        })?;
+        return Ok(compacted);
+    }
+    cancel.cancel();
+    let _ = operation.await;
+    drop(events);
+    drop(raw_mode);
+    renderer.render_status("cancelled")?;
+    Ok(false)
+}
+
 async fn wait_for_turn_interrupt(events: &mut EventStream) -> io::Result<()> {
     while let Some(event) = events.next().await {
         if let Event::Key(key) = event?
@@ -312,7 +464,7 @@ fn resolve_session(
     store: &mut SessionStore,
     args: &CliArgs,
     cwd: &str,
-    config: &Config,
+    default_selection: &ModelSelection,
 ) -> Result<crate::session::Session> {
     if let Some(id) = &args.resume_session_id {
         return store
@@ -329,12 +481,239 @@ fn resolve_session(
     {
         return Ok(session);
     }
-    let mut new_session =
-        NewSession::new(cwd, config.provider.kind.as_str(), &config.provider.model);
+    let mut new_session = NewSession::new(
+        cwd,
+        default_selection.provider.kind.as_str(),
+        &default_selection.provider.model,
+    )
+    .with_model_selection(&default_selection.name, default_selection.effort.as_deref());
     if let Some(key) = &args.fish_session_key {
         new_session = new_session.with_client_session_key(key);
     }
     store.create_session(new_session)
+}
+
+fn build_agent(
+    selection: &ModelSelection,
+    tools: Arc<ToolRunner>,
+    store: Arc<Mutex<SessionStore>>,
+    session_id: &str,
+    system_prompt: &str,
+    max_cycles: usize,
+) -> Result<Agent> {
+    Ok(Agent::new(
+        create_provider(selection.provider.clone())?,
+        tools,
+        store,
+        session_id.into(),
+        system_prompt.into(),
+        max_cycles,
+    )
+    .with_context_budget(
+        selection.context_window,
+        u64::from(selection.provider.max_tokens),
+    ))
+}
+
+fn switch_model_selection(
+    session: &mut crate::session::Session,
+    selection: &mut ModelSelection,
+    new_selection: ModelSelection,
+    store: &Arc<Mutex<SessionStore>>,
+) -> Result<()> {
+    store
+        .lock()
+        .map_err(|_| anyhow::anyhow!("session store lock poisoned"))?
+        .update_model_selection(
+            &session.id,
+            new_selection.provider.kind.as_str(),
+            &new_selection.provider.model,
+            &new_selection.name,
+            new_selection.effort.as_deref(),
+        )?;
+    session.provider_type = new_selection.provider.kind.as_str().into();
+    session.model = new_selection.provider.model.clone();
+    session.model_profile = Some(new_selection.name.clone());
+    session.effort = new_selection.effort.clone();
+    *selection = new_selection;
+    Ok(())
+}
+
+fn resume_session(
+    session: &mut crate::session::Session,
+    selection: &mut ModelSelection,
+    resumed: crate::session::Session,
+    config: &Config,
+    store: &Arc<Mutex<SessionStore>>,
+    fish_session_key: Option<&str>,
+) -> Result<()> {
+    if resumed.cwd != session.cwd {
+        anyhow::bail!("cannot resume a session from a different cwd");
+    }
+    let resumed_selection = config.resolve_session_model(
+        resumed.model_profile.as_deref(),
+        &resumed.provider_type,
+        &resumed.model,
+        resumed.effort.as_deref(),
+    )?;
+    if let Some(key) = fish_session_key {
+        store
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session store lock poisoned"))?
+            .rebind_client_session_key(&resumed.cwd, key, &resumed.id)?;
+    }
+    *session = resumed;
+    *selection = resumed_selection;
+    Ok(())
+}
+
+fn handle_slash_command(
+    input: &str,
+    config: &Config,
+    editor: &mut InputEditor,
+    renderer: &InlineRenderer,
+    store: &Arc<Mutex<SessionStore>>,
+    session: &crate::session::Session,
+    selection: &ModelSelection,
+) -> Result<SlashAction> {
+    let mut parts = input.split_whitespace();
+    let Some(command) = parts.next().filter(|command| command.starts_with('/')) else {
+        return Ok(SlashAction::NotCommand);
+    };
+    let argument = parts.next();
+    match command {
+        "/model" => {
+            let name = if let Some(name) = argument {
+                name.to_owned()
+            } else {
+                let names = config.model_names();
+                let labels = names
+                    .iter()
+                    .map(|name| {
+                        let model = config.resolve_model(Some(name), None)?;
+                        Ok(format!(
+                            "{name}  {} · {} · {}",
+                            model.provider.kind.as_str(),
+                            model.provider.model,
+                            model.effort.as_deref().unwrap_or("default")
+                        ))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let default = names
+                    .iter()
+                    .position(|name| *name == selection.name)
+                    .unwrap_or(0);
+                let Some(index) = editor.select_option("Model", &labels, default)? else {
+                    return Ok(SlashAction::Handled);
+                };
+                names[index].to_owned()
+            };
+            let selected = config.resolve_model(Some(&name), None)?;
+            renderer.render_status(&format!(
+                "model: {} · {} · effort {}",
+                selected.name,
+                selected.provider.model,
+                selected.effort.as_deref().unwrap_or("default")
+            ))?;
+            Ok(SlashAction::SwitchModel(selected))
+        }
+        "/effort" => {
+            if selection.efforts.is_empty() {
+                renderer.render_status("effort is not configured for the current model")?;
+                return Ok(SlashAction::Handled);
+            }
+            let effort = if let Some(effort) = argument {
+                effort.to_owned()
+            } else {
+                let default = selection
+                    .effort
+                    .as_ref()
+                    .and_then(|effort| selection.efforts.iter().position(|item| item == effort))
+                    .unwrap_or(0);
+                let Some(index) = editor.select_option("Effort", &selection.efforts, default)?
+                else {
+                    return Ok(SlashAction::Handled);
+                };
+                selection.efforts[index].clone()
+            };
+            let selected = config.resolve_model(Some(&selection.name), Some(&effort))?;
+            renderer.render_status(&format!("effort: {effort}"))?;
+            Ok(SlashAction::SwitchModel(selected))
+        }
+        "/status" => {
+            renderer.render_status(&format!(
+                "session {} · model {} · {} · effort {}",
+                session.id,
+                selection.name,
+                selection.provider.model,
+                selection.effort.as_deref().unwrap_or("default")
+            ))?;
+            Ok(SlashAction::Handled)
+        }
+        "/clear" => {
+            store
+                .lock()
+                .map_err(|_| anyhow::anyhow!("session store lock poisoned"))?
+                .clear_session(&session.id)?;
+            renderer.render_status("conversation cleared")?;
+            Ok(SlashAction::Handled)
+        }
+        "/compact" => Ok(SlashAction::Compact),
+        "/resume" => {
+            let resumed = if let Some(id) = argument {
+                store
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("session store lock poisoned"))?
+                    .get_session(id)?
+                    .with_context(|| format!("session not found: {id}"))?
+            } else {
+                let sessions = store
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("session store lock poisoned"))?
+                    .recent_sessions(&session.cwd, 20)?;
+                let labels = sessions
+                    .iter()
+                    .map(|candidate| {
+                        format!(
+                            "{}  {} · {}",
+                            candidate.id,
+                            candidate.model_profile.as_deref().unwrap_or("unconfigured"),
+                            candidate.model
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let default = sessions
+                    .iter()
+                    .position(|candidate| candidate.id == session.id)
+                    .unwrap_or(0);
+                let Some(index) = editor.select_option("Session", &labels, default)? else {
+                    return Ok(SlashAction::Handled);
+                };
+                sessions[index].clone()
+            };
+            if resumed.cwd != session.cwd {
+                anyhow::bail!("cannot resume a session from a different cwd");
+            }
+            Ok(SlashAction::Resume(resumed))
+        }
+        "/help" => {
+            renderer
+                .render_status("commands: /model /effort /status /clear /compact /resume /help")?;
+            Ok(SlashAction::Handled)
+        }
+        _ => {
+            renderer.render_status(&format!("unknown command: {command}"))?;
+            Ok(SlashAction::Handled)
+        }
+    }
+}
+
+enum SlashAction {
+    NotCommand,
+    Handled,
+    SwitchModel(ModelSelection),
+    Compact,
+    Resume(crate::session::Session),
 }
 
 fn resolve_targets(cwd: &Path, files: &[String]) -> Result<Vec<PathBuf>> {

@@ -32,12 +32,14 @@ async fn read_returns_numbered_bounded_lines() {
 }
 
 #[tokio::test]
-async fn read_rejects_binary_and_workspace_escape() {
+async fn read_rejects_binary_and_allows_paths_outside_the_workspace() {
     let temp = tempdir().unwrap();
-    fs::write(temp.path().join("binary"), [0, 1, 2]).unwrap();
+    let workspace = temp.path().join("workspace");
+    fs::create_dir(&workspace).unwrap();
+    fs::write(workspace.join("binary"), [0, 1, 2]).unwrap();
     assert!(
         read_text_file(
-            temp.path(),
+            &workspace,
             &ReadArgs {
                 path: "binary".into(),
                 offset: 0,
@@ -50,21 +52,36 @@ async fn read_rejects_binary_and_workspace_escape() {
         .to_string()
         .contains("binary")
     );
-    assert!(
-        read_text_file(
-            temp.path(),
-            &ReadArgs {
-                path: "../outside".into(),
-                offset: 0,
-                limit: None
-            },
-            10
-        )
-        .await
-        .unwrap_err()
-        .to_string()
-        .contains("outside")
-    );
+    fs::write(temp.path().join("outside.txt"), "outside\n").unwrap();
+    let relative = read_text_file(
+        &workspace,
+        &ReadArgs {
+            path: "../outside.txt".into(),
+            offset: 0,
+            limit: None,
+        },
+        10,
+    )
+    .await
+    .unwrap();
+    assert_eq!(relative, "1: outside");
+
+    let absolute = read_text_file(
+        &workspace,
+        &ReadArgs {
+            path: temp
+                .path()
+                .join("outside.txt")
+                .to_string_lossy()
+                .into_owned(),
+            offset: 0,
+            limit: None,
+        },
+        10,
+    )
+    .await
+    .unwrap();
+    assert_eq!(absolute, "1: outside");
 }
 
 #[tokio::test]
@@ -88,29 +105,37 @@ async fn patch_adds_updates_and_deletes_atomically() {
 }
 
 #[tokio::test]
-async fn patch_rejects_stale_context_and_escape_without_writes() {
+async fn patch_rejects_stale_context_and_allows_paths_outside_the_workspace() {
     let temp = tempdir().unwrap();
-    fs::write(temp.path().join("a.txt"), "current\n").unwrap();
+    let workspace = temp.path().join("workspace");
+    fs::create_dir(&workspace).unwrap();
+    fs::write(workspace.join("a.txt"), "current\n").unwrap();
     let stale = "*** Begin Patch\n*** Update File: a.txt\n@@\n-old\n+new\n*** End Patch";
     assert!(
-        apply_patch(temp.path(), stale)
+        apply_patch(&workspace, stale)
             .await
             .unwrap_err()
             .to_string()
             .contains("context not found")
     );
     assert_eq!(
-        fs::read_to_string(temp.path().join("a.txt")).unwrap(),
+        fs::read_to_string(workspace.join("a.txt")).unwrap(),
         "current\n"
     );
     let escape = "*** Begin Patch\n*** Add File: ../escape.txt\n+no\n*** End Patch";
-    assert!(
-        apply_patch(temp.path(), escape)
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("outside")
+    apply_patch(&workspace, escape).await.unwrap();
+    assert_eq!(
+        fs::read_to_string(temp.path().join("escape.txt")).unwrap(),
+        "no\n"
     );
+
+    let absolute_path = temp.path().join("absolute.txt");
+    let absolute = format!(
+        "*** Begin Patch\n*** Add File: {}\n+absolute\n*** End Patch",
+        absolute_path.display()
+    );
+    apply_patch(&workspace, &absolute).await.unwrap();
+    assert_eq!(fs::read_to_string(absolute_path).unwrap(), "absolute\n");
 }
 
 #[test]

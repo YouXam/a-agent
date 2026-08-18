@@ -17,8 +17,9 @@ pub fn build_system_prompt(input: &ContextInput) -> String {
     let mut prompt = format!(
         "You are a coding agent operating in {}.\n\n\
          Inspect only what you need. Prefer minimal, targeted changes.\n\
+         Use tools only when the request requires workspace facts or actions. Answer simple conversation, formatting, and direct-answer requests without tools. Never inspect the workspace merely because it is available.\n\
          Use read to inspect files before editing. Use apply_patch for file edits.\n\
-         apply_patch file paths must be relative to the cwd.\n\
+         Relative read and apply_patch paths are resolved from the cwd; absolute paths and parent traversal are allowed.\n\
          Use bash for search, git, build, tests, and other shell operations.\n\
          Before any git command, first confirm that .git exists; otherwise do not run git.\n\n\
          When independent tool calls can run in parallel, issue them together.\n\

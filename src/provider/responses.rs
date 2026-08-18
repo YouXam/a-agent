@@ -75,18 +75,26 @@ impl ResponsesProvider {
                 Role::System => {}
             }
         }
-        let tools = tool_definitions()
-            .into_iter()
-            .map(|mut tool| {
-                tool.as_object_mut()
-                    .expect("tool definition is an object")
-                    .insert("type".into(), Value::String("function".into()));
-                tool
-            })
-            .collect::<Vec<_>>();
+        let tools = if request.include_tools {
+            tool_definitions()
+                .into_iter()
+                .map(|mut tool| {
+                    tool.as_object_mut()
+                        .expect("tool definition is an object")
+                        .insert("type".into(), Value::String("function".into()));
+                    tool
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         let mut body = serde_json::Map::new();
         merge_request_fields(&mut body, &self.config);
         body.insert("model".into(), Value::String(self.config.model.clone()));
+        body.insert(
+            "max_output_tokens".into(),
+            Value::from(self.config.max_tokens),
+        );
         body.insert("instructions".into(), Value::String(request.system_prompt));
         body.insert("input".into(), Value::Array(input));
         body.insert("tools".into(), Value::Array(tools));
@@ -185,14 +193,9 @@ impl ResponsesLive {
                 }
             }
             "response.completed" => {
-                let raw = &value["response"]["usage"];
-                sink.emit(StreamEvent::Usage(Usage {
-                    input_tokens: raw.get("input_tokens").and_then(Value::as_u64),
-                    output_tokens: raw.get("output_tokens").and_then(Value::as_u64),
-                    cached_tokens: raw
-                        .pointer("/input_tokens_details/cached_tokens")
-                        .and_then(Value::as_u64),
-                }));
+                sink.emit(StreamEvent::Usage(normalize_usage(
+                    &value["response"]["usage"],
+                )));
                 sink.emit(StreamEvent::Done);
             }
             "error" => sink.emit(StreamEvent::Error {
@@ -291,14 +294,7 @@ pub fn normalize_events(values: Vec<Value>) -> Result<(ModelTurn, Vec<StreamEven
                 }
             }
             "response.completed" => {
-                let raw = &value["response"]["usage"];
-                usage = Some(Usage {
-                    input_tokens: raw.get("input_tokens").and_then(Value::as_u64),
-                    output_tokens: raw.get("output_tokens").and_then(Value::as_u64),
-                    cached_tokens: raw
-                        .pointer("/input_tokens_details/cached_tokens")
-                        .and_then(Value::as_u64),
-                });
+                usage = Some(normalize_usage(&value["response"]["usage"]));
             }
             "response.failed" | "response.incomplete" => {
                 anyhow::bail!("provider response did not complete: {}", value);
@@ -336,6 +332,27 @@ pub fn normalize_events(values: Vec<Value>) -> Result<(ModelTurn, Vec<StreamEven
         },
         stream_events,
     ))
+}
+
+fn normalize_usage(raw: &Value) -> Usage {
+    let cached_tokens = raw
+        .pointer("/input_tokens_details/cached_tokens")
+        .and_then(Value::as_u64);
+    let cache_write_tokens = raw
+        .pointer("/input_tokens_details/cache_write_tokens")
+        .and_then(Value::as_u64);
+    Usage {
+        input_tokens: raw
+            .get("input_tokens")
+            .and_then(Value::as_u64)
+            .map(|input| {
+                input.saturating_sub(cached_tokens.unwrap_or(0) + cache_write_tokens.unwrap_or(0))
+            }),
+        output_tokens: raw.get("output_tokens").and_then(Value::as_u64),
+        cached_tokens,
+        cache_write_tokens,
+        total_tokens: raw.get("total_tokens").and_then(Value::as_u64),
+    }
 }
 
 fn string(value: &Value, key: &str) -> String {

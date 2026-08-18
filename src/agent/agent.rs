@@ -15,6 +15,8 @@ pub struct Agent {
     session_id: String,
     system_prompt: String,
     max_cycles: usize,
+    context_window: Option<u64>,
+    max_output_tokens: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,7 +41,19 @@ impl Agent {
             session_id,
             system_prompt,
             max_cycles,
+            context_window: None,
+            max_output_tokens: 0,
         }
+    }
+
+    pub fn with_context_budget(
+        mut self,
+        context_window: Option<u64>,
+        max_output_tokens: u64,
+    ) -> Self {
+        self.context_window = context_window;
+        self.max_output_tokens = max_output_tokens;
+        self
     }
 
     pub async fn submit(
@@ -48,6 +62,8 @@ impl Agent {
         events: EventSink,
         cancel: CancellationToken,
     ) -> Result<AgentResult> {
+        self.compact_if_needed(Some(prompt), &events, &cancel)
+            .await?;
         self.store
             .lock()
             .map_err(|_| anyhow::anyhow!("session store lock poisoned"))?
@@ -61,6 +77,7 @@ impl Agent {
             if cancel.is_cancelled() {
                 anyhow::bail!("agent turn cancelled");
             }
+            self.compact_if_needed(None, &events, &cancel).await?;
             let messages = self
                 .store
                 .lock()
@@ -75,6 +92,7 @@ impl Agent {
             let request = ModelRequest {
                 system_prompt: self.system_prompt.clone(),
                 messages,
+                include_tools: true,
             };
             events.emit(StreamEvent::GenerationStart);
             let turn = self
@@ -85,7 +103,7 @@ impl Agent {
                 self.store
                     .lock()
                     .map_err(|_| anyhow::anyhow!("session store lock poisoned"))?
-                    .append_item(&self.session_id, Role::Assistant, turn.blocks.clone())?;
+                    .append_assistant_item(&self.session_id, turn.blocks.clone(), turn.usage)?;
             }
             if let Some(state) = &turn.provider_state {
                 self.store
@@ -131,6 +149,85 @@ impl Agent {
         .context("maximum agent cycles reached before a final response")
     }
 
+    async fn compact_if_needed(
+        &self,
+        additional_prompt: Option<&str>,
+        events: &EventSink,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        let Some(context_window) = self.context_window else {
+            return Ok(());
+        };
+        let threshold = context_window.saturating_sub(self.max_output_tokens);
+        let branch = self
+            .store
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session store lock poisoned"))?
+            .active_branch(&self.session_id)?;
+        if let Some(summary_index) = branch.iter().rposition(is_compaction_summary)
+            && !branch[summary_index + 1..].iter().any(has_valid_usage)
+        {
+            return Ok(());
+        }
+        if branch.is_empty()
+            || estimate_context_tokens(&self.system_prompt, &branch, additional_prompt) <= threshold
+        {
+            return Ok(());
+        }
+        self.compact_branch(branch, events, cancel).await
+    }
+
+    async fn compact_branch(
+        &self,
+        branch: Vec<crate::model::ConversationItem>,
+        events: &EventSink,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        let messages = branch
+            .iter()
+            .map(|item| ModelMessage {
+                role: item.role,
+                blocks: item.blocks.clone(),
+            })
+            .collect();
+        let request = ModelRequest {
+            system_prompt: "Summarize this coding-agent conversation for continuation. Preserve user goals, decisions, modified files, tool results, failures, unresolved work, and exact technical constraints. Return only the compact summary and do not call tools.".into(),
+            messages,
+            include_tools: false,
+        };
+        events.emit(StreamEvent::GenerationStart);
+        let result = self
+            .provider
+            .stream_turn(request, EventSink::default(), cancel.clone())
+            .await;
+        events.emit(StreamEvent::Done);
+        let turn = result.context("compact conversation")?;
+        if !turn.tool_calls.is_empty() {
+            anyhow::bail!("compaction model attempted to call tools");
+        }
+        let summary = turn
+            .final_text()
+            .context("compaction model returned no summary")?;
+        self.store
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session store lock poisoned"))?
+            .replace_branch_with_summary(&self.session_id, &summary)?;
+        Ok(())
+    }
+
+    pub async fn compact(&self, events: EventSink, cancel: CancellationToken) -> Result<bool> {
+        let branch = self
+            .store
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session store lock poisoned"))?
+            .active_branch(&self.session_id)?;
+        if branch.is_empty() {
+            return Ok(false);
+        }
+        self.compact_branch(branch, &events, &cancel).await?;
+        Ok(true)
+    }
+
     pub fn record_interruption(&self) -> Result<()> {
         self.store
             .lock()
@@ -138,4 +235,69 @@ impl Agent {
             .append_turn_interrupted(&self.session_id)?;
         Ok(())
     }
+}
+
+fn is_compaction_summary(item: &crate::model::ConversationItem) -> bool {
+    item.blocks.iter().any(|block| {
+        matches!(block, ContentBlock::Text(text) if text.starts_with(crate::session::CONVERSATION_SUMMARY_PREFIX))
+    })
+}
+
+fn has_valid_usage(item: &crate::model::ConversationItem) -> bool {
+    item.role == Role::Assistant
+        && item
+            .usage
+            .and_then(|usage| usage.context_tokens())
+            .is_some_and(|tokens| tokens > 0)
+}
+
+fn estimate_context_tokens(
+    system_prompt: &str,
+    branch: &[crate::model::ConversationItem],
+    additional_prompt: Option<&str>,
+) -> u64 {
+    let usage_anchor = branch.iter().enumerate().rev().find_map(|(index, item)| {
+        (item.role == Role::Assistant)
+            .then_some(item.usage)
+            .flatten()
+            .and_then(|usage| usage.context_tokens())
+            .filter(|tokens| *tokens > 0)
+            .map(|tokens| (index, tokens))
+    });
+    let (start, mut tokens) = usage_anchor.map_or_else(
+        || {
+            let tools =
+                serde_json::to_string(&crate::provider::tool_definitions()).unwrap_or_default();
+            (
+                0,
+                estimate_text_tokens(system_prompt) + estimate_text_tokens(&tools),
+            )
+        },
+        |(index, tokens)| (index + 1, tokens),
+    );
+    for item in &branch[start..] {
+        tokens += estimate_blocks_tokens(&item.blocks);
+    }
+    if let Some(prompt) = additional_prompt {
+        tokens += estimate_text_tokens(prompt);
+    }
+    tokens
+}
+
+fn estimate_blocks_tokens(blocks: &[ContentBlock]) -> u64 {
+    let characters = blocks
+        .iter()
+        .map(|block| match block {
+            ContentBlock::Text(text) | ContentBlock::Reasoning(text) => text.chars().count(),
+            ContentBlock::ToolCall(call) => {
+                call.name.chars().count() + call.arguments.chars().count()
+            }
+            ContentBlock::ToolResult(result) => result.output.chars().count(),
+        })
+        .sum::<usize>();
+    characters.div_ceil(4) as u64
+}
+
+fn estimate_text_tokens(text: &str) -> u64 {
+    text.chars().count().div_ceil(4) as u64
 }

@@ -4,12 +4,19 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use a_agent::fish::install_to;
-use a_agent::session::TURN_INTERRUPTED_NOTICE;
+use a_agent::session::{SessionStore, TURN_INTERRUPTED_NOTICE};
 use tempfile::tempdir;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 use tokio::process::Command;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+fn responses_config(base_url: &str) -> String {
+    format!(
+        "default_model = \"test\"\n\n[providers.test]\ntype = \"responses\"\nbase_url = \"{base_url}/v1\"\napi_key = \"secret\"\n\n[models.test]\nprovider = \"test\"\nmodel = \"test-model\"\neffort = \"low\"\nefforts = [\"low\", \"medium\", \"high\"]\n"
+    )
+}
 
 #[tokio::test]
 async fn one_turn_cli_persists_and_resumes_without_eager_file_content() {
@@ -38,16 +45,7 @@ async fn one_turn_cli_persists_and_resumes_without_eager_file_content() {
     fs::write(repo.join("src/target.rs"), "EAGER_CONTENT_MUST_NOT_APPEAR").unwrap();
     fs::write(
         home.join(".config/a/config.toml"),
-        format!(
-            r#"
-[provider]
-type = "responses"
-base_url = "{}/v1"
-model = "test-model"
-api_key_env = "TEST_API_KEY"
-"#,
-            server.uri()
-        ),
+        responses_config(&server.uri()),
     )
     .unwrap();
 
@@ -136,10 +134,7 @@ async fn fish_session_keys_isolate_conversations_in_the_same_cwd() {
     fs::create_dir_all(&repo).unwrap();
     fs::write(
         home.join(".config/a/config.toml"),
-        format!(
-            "[provider]\ntype = \"responses\"\nbase_url = \"{}/v1\"\nmodel = \"test-model\"\napi_key = \"secret\"\n",
-            server.uri()
-        ),
+        responses_config(&server.uri()),
     )
     .unwrap();
 
@@ -170,6 +165,294 @@ async fn fish_session_keys_isolate_conversations_in_the_same_cwd() {
     assert!(!second.contains("reply-from-one"), "{second}");
     assert!(third.contains("reply-from-one"), "{third}");
     assert!(!third.contains("reply-from-two"), "{third}");
+}
+
+#[tokio::test]
+async fn fish_slash_commands_persist_model_and_effort_without_model_requests() {
+    let server = MockServer::start().await;
+    let sse = concat!(
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"configured\"}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{}}}\n\n",
+        "data: [DONE]\n\n"
+    );
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse),
+        )
+        .mount(&server)
+        .await;
+
+    let temp = tempdir().unwrap();
+    let home = temp.path().join("home");
+    let repo = temp.path().join("repo");
+    let state = temp.path().join("state");
+    fs::create_dir_all(home.join(".config/a")).unwrap();
+    fs::create_dir_all(&repo).unwrap();
+    fs::write(
+        home.join(".config/a/config.toml"),
+        format!(
+            r#"
+default_model = "fast"
+
+[providers.test]
+type = "responses"
+base_url = "{}/v1"
+api_key = "secret"
+
+[models.fast]
+provider = "test"
+model = "gpt-fast"
+effort = "low"
+efforts = ["low", "medium"]
+
+[models.deep]
+provider = "test"
+model = "gpt-deep"
+effort = "high"
+efforts = ["high", "max"]
+"#,
+            server.uri()
+        ),
+    )
+    .unwrap();
+
+    for prompt in ["/model deep", "/effort max", "use current settings"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_a"))
+            .args([
+                "--fish-ai",
+                "--fish-session-key",
+                "slash-session",
+                "-1",
+                prompt,
+            ])
+            .current_dir(&repo)
+            .env("HOME", &home)
+            .env("XDG_STATE_HOME", &state)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(body["model"], "gpt-deep");
+    assert_eq!(body["reasoning"]["effort"], "max");
+    let store = SessionStore::open(&state.join("a/sessions.db")).unwrap();
+    let session = store
+        .find_client_session(repo.to_str().unwrap(), "slash-session")
+        .unwrap()
+        .unwrap();
+    assert_eq!(session.model_profile.as_deref(), Some("deep"));
+    assert_eq!(session.effort.as_deref(), Some("max"));
+}
+
+#[tokio::test]
+async fn fish_resume_command_rebinds_the_session_without_a_model_request() {
+    let temp = tempdir().unwrap();
+    let home = temp.path().join("home");
+    let repo = temp.path().join("repo");
+    let state = temp.path().join("state");
+    fs::create_dir_all(home.join(".config/a")).unwrap();
+    fs::create_dir_all(&repo).unwrap();
+    fs::write(
+        home.join(".config/a/config.toml"),
+        r#"
+default_model = "test"
+[providers.test]
+type = "responses"
+api_key = "secret"
+[models.test]
+provider = "test"
+model = "test-model"
+"#,
+    )
+    .unwrap();
+    let target_id = {
+        let mut store = SessionStore::open(&state.join("a/sessions.db")).unwrap();
+        store
+            .create_session(
+                a_agent::session::NewSession::new(
+                    repo.to_str().unwrap(),
+                    "responses",
+                    "test-model",
+                )
+                .with_client_session_key("fish-resume")
+                .with_model_selection("test", None),
+            )
+            .unwrap();
+        store
+            .create_session(
+                a_agent::session::NewSession::new(
+                    repo.to_str().unwrap(),
+                    "responses",
+                    "test-model",
+                )
+                .with_model_selection("test", None),
+            )
+            .unwrap()
+            .id
+    };
+
+    let output = Command::new(env!("CARGO_BIN_EXE_a"))
+        .args([
+            "--fish-ai",
+            "--fish-session-key",
+            "fish-resume",
+            "-1",
+            &format!("/resume {target_id}"),
+        ])
+        .current_dir(&repo)
+        .env("HOME", &home)
+        .env("XDG_STATE_HOME", &state)
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let store = SessionStore::open(&state.join("a/sessions.db")).unwrap();
+    assert_eq!(
+        store
+            .find_client_session(repo.to_str().unwrap(), "fish-resume")
+            .unwrap()
+            .unwrap()
+            .id,
+        target_id
+    );
+}
+
+#[tokio::test]
+async fn compact_command_skips_the_api_for_an_empty_session() {
+    let temp = tempdir().unwrap();
+    let home = temp.path().join("home");
+    let repo = temp.path().join("repo");
+    let state = temp.path().join("state");
+    fs::create_dir_all(home.join(".config/a")).unwrap();
+    fs::create_dir_all(&repo).unwrap();
+    fs::write(
+        home.join(".config/a/config.toml"),
+        r#"
+default_model = "test"
+[providers.test]
+type = "responses"
+api_key = "secret"
+[models.test]
+provider = "test"
+model = "test-model"
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_a"))
+        .args(["-1", "/compact"])
+        .current_dir(&repo)
+        .env("HOME", &home)
+        .env("XDG_STATE_HOME", &state)
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("no conversation to compact"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn fish_model_command_opens_an_arrow_key_selector() {
+    if Command::new("tmux").arg("-V").output().await.is_err() {
+        return;
+    }
+    let temp = tempdir().unwrap();
+    let home = temp.path().join("home");
+    let repo = temp.path().join("repo");
+    let state = temp.path().join("state");
+    fs::create_dir_all(home.join(".config/a")).unwrap();
+    fs::create_dir_all(&repo).unwrap();
+    fs::write(
+        home.join(".config/a/config.toml"),
+        r#"
+default_model = "fast"
+[providers.test]
+type = "responses"
+api_key = "secret"
+[models.deep]
+provider = "test"
+model = "gpt-deep"
+[models.fast]
+provider = "test"
+model = "gpt-fast"
+"#,
+    )
+    .unwrap();
+
+    let socket = format!("a-model-select-{}", std::process::id());
+    let session = "model-select";
+    let shell = format!(
+        "env HOME={} XDG_STATE_HOME={} bash --noprofile --norc",
+        home.display(),
+        state.display()
+    );
+    assert!(
+        Command::new("tmux")
+            .args([
+                "-L",
+                &socket,
+                "new-session",
+                "-d",
+                "-x",
+                "90",
+                "-y",
+                "24",
+                "-s",
+                session,
+                "-c",
+                repo.to_str().unwrap(),
+                &shell,
+            ])
+            .status()
+            .await
+            .unwrap()
+            .success()
+    );
+    tmux_send_text(
+        &socket,
+        session,
+        &format!(
+            "{} --fish-ai --fish-session-key selector -1 /model",
+            env!("CARGO_BIN_EXE_a")
+        ),
+    )
+    .await;
+    tmux_send_key(&socket, session, "Enter").await;
+    wait_for_tmux_text(&socket, session, "Model").await;
+    tmux_send_key(&socket, session, "Up").await;
+    tmux_send_key(&socket, session, "Enter").await;
+    wait_for_pane_command(&socket, session, "bash").await;
+
+    let store = SessionStore::open(&state.join("a/sessions.db")).unwrap();
+    let selected = store
+        .find_client_session(repo.to_str().unwrap(), "selector")
+        .unwrap()
+        .unwrap();
+    let _ = Command::new("tmux")
+        .args(["-L", &socket, "kill-server"])
+        .status()
+        .await;
+    assert_eq!(selected.model_profile.as_deref(), Some("deep"));
 }
 
 #[tokio::test]
@@ -208,16 +491,7 @@ async fn one_turn_cli_completes_a_model_tool_model_cycle() {
     fs::write(repo.join("a.rs"), "code\n").unwrap();
     fs::write(
         home.join(".config/a/config.toml"),
-        format!(
-            r#"
-[provider]
-type = "responses"
-base_url = "{}/v1"
-model = "test-model"
-api_key_env = "TEST_API_KEY"
-"#,
-            server.uri()
-        ),
+        responses_config(&server.uri()),
     )
     .unwrap();
 
@@ -301,16 +575,7 @@ async fn interactive_tui_is_inline_aligned_and_does_not_duplicate_input() {
     fs::create_dir_all(&repo).unwrap();
     fs::write(
         home.join(".config/a/config.toml"),
-        format!(
-            r#"
-[provider]
-type = "responses"
-base_url = "{}/v1"
-model = "test-model"
-api_key = "secret"
-"#,
-            server.uri()
-        ),
+        responses_config(&server.uri()),
     )
     .unwrap();
 
@@ -345,6 +610,8 @@ api_key = "secret"
         String::from_utf8_lossy(&started.stderr)
     );
     wait_for_agent_prompt(&socket, session).await;
+    let initial_prompt = tmux_pane(&socket, session).await;
+    assert!(initial_prompt.contains("multi · tab"), "{initial_prompt:?}");
     assert!(
         Command::new("tmux")
             .args(["-L", &socket, "send-keys", "-t", session, "-l", "hi"])
@@ -400,6 +667,19 @@ api_key = "secret"
         "{history:?}"
     );
 
+    tmux_send_key(&socket, session, "Escape").await;
+    let single_escape = wait_for_tmux_text(&socket, session, "Rewind to:").await;
+    assert!(single_escape.contains("rewind>"), "{single_escape:?}");
+    tmux_send_key(&socket, session, "C-c").await;
+    wait_for_agent_prompt(&socket, session).await;
+    tmux_send_text(&socket, session, "retained").await;
+    let after_single_escape = wait_for_tmux_text(&socket, session, "a> retained").await;
+    assert!(
+        after_single_escape.contains("a> retained"),
+        "{after_single_escape:?}"
+    );
+    tmux_send_key(&socket, session, "C-u").await;
+
     assert!(
         Command::new("tmux")
             .args([
@@ -438,6 +718,135 @@ api_key = "secret"
 
 #[cfg(unix)]
 #[tokio::test]
+async fn interactive_generation_streams_reasoning_and_text_above_the_spinner() {
+    if Command::new("tmux").arg("-V").output().await.is_err() {
+        return;
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let count = stream.read(&mut buffer).await.unwrap();
+            if count == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..count]);
+        }
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        for data in [
+            serde_json::json!({"type":"response.reasoning_summary_text.delta","delta":"streaming reason"}).to_string(),
+            serde_json::json!({"type":"response.output_text.delta","delta":"first "}).to_string(),
+            serde_json::json!({"type":"response.output_text.delta","delta":"second"}).to_string(),
+            serde_json::json!({"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":2}}}).to_string(),
+        ] {
+            let event = format!("data: {data}\n\n");
+            stream
+                .write_all(format!("{:x}\r\n", event.len()).as_bytes())
+                .await
+                .unwrap();
+            stream.write_all(event.as_bytes()).await.unwrap();
+            stream.write_all(b"\r\n").await.unwrap();
+            stream.flush().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        }
+        let done = "data: [DONE]\n\n";
+        stream
+            .write_all(format!("{:x}\r\n{done}\r\n0\r\n\r\n", done.len()).as_bytes())
+            .await
+            .unwrap();
+    });
+
+    let temp = tempdir().unwrap();
+    let home = temp.path().join("home");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(home.join(".config/a")).unwrap();
+    fs::create_dir_all(&repo).unwrap();
+    fs::write(
+        home.join(".config/a/config.toml"),
+        format!(
+            "{}\n[ui]\nshow_reasoning = true\n",
+            responses_config(&format!("http://{address}"))
+        ),
+    )
+    .unwrap();
+
+    let socket = format!("a-stream-test-{}", std::process::id());
+    let session = "streaming";
+    assert!(
+        Command::new("tmux")
+            .args([
+                "-L",
+                &socket,
+                "new-session",
+                "-d",
+                "-x",
+                "80",
+                "-y",
+                "24",
+                "-s",
+                session,
+                "-c",
+                repo.to_str().unwrap(),
+                "-e",
+                &format!("HOME={}", home.display()),
+                "-e",
+                &format!("XDG_STATE_HOME={}", temp.path().join("state").display()),
+                env!("CARGO_BIN_EXE_a"),
+            ])
+            .status()
+            .await
+            .unwrap()
+            .success()
+    );
+    wait_for_agent_prompt(&socket, session).await;
+    tmux_send_text(&socket, session, "stream now").await;
+    tmux_send_key(&socket, session, "Enter").await;
+
+    let reasoning = wait_for_tmux_text(&socket, session, "streaming reason").await;
+    assert!(reasoning.contains("▾ Reasoning"), "{reasoning:?}");
+    assert!(reasoning.contains("thinking"), "{reasoning:?}");
+    assert!(
+        reasoning.find("streaming reason").unwrap() < reasoning.find("thinking").unwrap(),
+        "{reasoning:?}"
+    );
+
+    let text = wait_for_tmux_text(&socket, session, "│ first ").await;
+    assert!(text.contains("generating"), "{text:?}");
+    assert!(
+        text.find("│ first ").unwrap() < text.find("generating").unwrap(),
+        "{text:?}"
+    );
+
+    let final_screen = wait_for_tmux_text(&socket, session, "│ first second").await;
+    wait_for_agent_prompt(&socket, session).await;
+    let history = tmux_history(&socket, session).await;
+    assert_eq!(
+        history.matches("streaming reason").count(),
+        1,
+        "{history:?}"
+    );
+    assert_eq!(history.matches("│ first second").count(), 1, "{history:?}");
+    assert!(!history.contains("thinking"), "{history:?}");
+    assert!(!history.contains("generating"), "{history:?}");
+    assert!(final_screen.contains("│ first second"), "{final_screen:?}");
+
+    let _ = Command::new("tmux")
+        .args(["-L", &socket, "kill-server"])
+        .status()
+        .await;
+    server.await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn fresh_fish_records_shell_history_that_reaches_the_agent_request() {
     if Command::new("tmux").arg("-V").output().await.is_err() {
         return;
@@ -468,16 +877,7 @@ async fn fresh_fish_records_shell_history_that_reaches_the_agent_request() {
     fs::create_dir_all(&bin).unwrap();
     fs::write(
         home.join(".config/a/config.toml"),
-        format!(
-            r#"
-[provider]
-type = "responses"
-base_url = "{}/v1"
-model = "test-model"
-api_key = "secret"
-"#,
-            server.uri()
-        ),
+        responses_config(&server.uri()),
     )
     .unwrap();
     install_to(&home).unwrap();
@@ -599,19 +999,13 @@ async fn live_bash_output_auto_scrolls_and_commits_a_bounded_final_block() {
     fs::write(
         home.join(".config/a/config.toml"),
         format!(
-            r#"
-[provider]
-type = "responses"
-base_url = "{}/v1"
-model = "test-model"
-api_key = "secret"
-
+            "{}\n\
 [ui]
 tool_live_output_lines = 2
 tool_output_max_lines = 3
 tool_output_max_bytes = 4096
-"#,
-            server.uri()
+",
+            responses_config(&server.uri())
         ),
     )
     .unwrap();
@@ -731,10 +1125,7 @@ async fn escape_cancels_a_running_bash_tool_and_returns_to_the_shell() {
     fs::create_dir_all(&repo).unwrap();
     fs::write(
         home.join(".config/a/config.toml"),
-        format!(
-            "[provider]\ntype = \"responses\"\nbase_url = \"{}/v1\"\nmodel = \"test-model\"\napi_key = \"secret\"\n",
-            server.uri()
-        ),
+        responses_config(&server.uri()),
     )
     .unwrap();
 
@@ -827,6 +1218,103 @@ async fn escape_cancels_a_running_bash_tool_and_returns_to_the_shell() {
     assert!(resumed_body.contains("next"), "{resumed_body}");
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn standalone_input_history_is_shared_and_once_mode_exits_after_response() {
+    if Command::new("tmux").arg("-V").output().await.is_err() {
+        return;
+    }
+    let server = MockServer::start().await;
+    let sse = concat!(
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"history response\"}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{}}}\n\n",
+        "data: [DONE]\n\n"
+    );
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse),
+        )
+        .mount(&server)
+        .await;
+
+    let temp = tempdir().unwrap();
+    let home = temp.path().join("home");
+    let repo = temp.path().join("repo");
+    let state = temp.path().join("state");
+    fs::create_dir_all(home.join(".config/a")).unwrap();
+    fs::create_dir_all(&repo).unwrap();
+    fs::write(
+        home.join(".config/a/config.toml"),
+        responses_config(&server.uri()),
+    )
+    .unwrap();
+
+    let socket = format!("a-history-{}", std::process::id());
+    let session = "history";
+    let shell = format!(
+        "env HOME={} XDG_STATE_HOME={} bash --noprofile --norc",
+        home.display(),
+        state.display()
+    );
+    assert!(
+        Command::new("tmux")
+            .args([
+                "-L",
+                &socket,
+                "new-session",
+                "-d",
+                "-x",
+                "90",
+                "-y",
+                "24",
+                "-s",
+                session,
+                "-c",
+                repo.to_str().unwrap(),
+                &shell,
+            ])
+            .status()
+            .await
+            .unwrap()
+            .success()
+    );
+
+    for prompt in ["persisted history", "one shot"] {
+        tmux_send_text(&socket, session, env!("CARGO_BIN_EXE_a")).await;
+        tmux_send_key(&socket, session, "Enter").await;
+        wait_for_agent_prompt(&socket, session).await;
+        if prompt == "persisted history" {
+            tmux_send_text(&socket, session, prompt).await;
+        } else {
+            tmux_send_key(&socket, session, "Up").await;
+            let recalled = wait_for_tmux_text(&socket, session, "a> persisted history").await;
+            assert!(recalled.contains("persisted history"), "{recalled:?}");
+            tmux_send_key(&socket, session, "C-u").await;
+            tmux_send_key(&socket, session, "Tab").await;
+            wait_for_tmux_text(&socket, session, "once · tab").await;
+            tmux_send_text(&socket, session, prompt).await;
+        }
+        tmux_send_key(&socket, session, "Enter").await;
+        wait_for_tmux_text(&socket, session, "history response").await;
+        if prompt == "persisted history" {
+            tmux_send_key(&socket, session, "C-c").await;
+            wait_for_pane_command(&socket, session, "bash").await;
+        } else {
+            wait_for_pane_command(&socket, session, "bash").await;
+        }
+    }
+
+    let requests = server.received_requests().await.unwrap();
+    let _ = Command::new("tmux")
+        .args(["-L", &socket, "kill-server"])
+        .status()
+        .await;
+    assert_eq!(requests.len(), 2);
+}
+
 async fn tmux_send_text(socket: &str, session: &str, text: &str) {
     assert!(
         Command::new("tmux")
@@ -836,6 +1324,29 @@ async fn tmux_send_text(socket: &str, session: &str, text: &str) {
             .unwrap()
             .success()
     );
+}
+
+async fn wait_for_pane_command(socket: &str, session: &str, command: &str) {
+    for _ in 0..120 {
+        let output = Command::new("tmux")
+            .args([
+                "-L",
+                socket,
+                "display-message",
+                "-p",
+                "-t",
+                session,
+                "#{pane_current_command}",
+            ])
+            .output()
+            .await
+            .unwrap();
+        if String::from_utf8_lossy(&output.stdout).trim() == command {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("pane did not return to {command}");
 }
 
 async fn tmux_send_key(socket: &str, session: &str, key: &str) {
@@ -909,7 +1420,10 @@ async fn wait_for_agent_prompt(socket: &str, session: &str) {
             .lines()
             .rev()
             .find(|line| !line.trim().is_empty())
-            .is_some_and(|line| line.trim() == "a>")
+            .is_some_and(|line| {
+                let line = line.trim();
+                line.starts_with("a>") && line.contains("multi · tab")
+            })
         {
             return;
         }

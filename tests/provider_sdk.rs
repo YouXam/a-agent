@@ -60,6 +60,7 @@ fn request() -> ModelRequest {
             role: Role::User,
             blocks: vec![ContentBlock::Text("hello".into())],
         }],
+        include_tools: true,
     }
 }
 
@@ -87,7 +88,8 @@ async fn responses_sdk_honors_custom_base_headers_and_streams() {
         .and(body_partial_json(serde_json::json!({
             "model": "test-model",
             "stream": true,
-            "instructions": "system rules"
+            "instructions": "system rules",
+            "max_output_tokens": 1024
         })))
         .respond_with(
             ResponseTemplate::new(200)
@@ -132,7 +134,7 @@ async fn chat_completion_sdk_honors_custom_base_and_normalizes_stream() {
         .and(path("/v1/chat/completions"))
         .and(header("x-tenant", "acme"))
         .and(body_partial_json(
-            serde_json::json!({"model":"test-model","stream":true}),
+            serde_json::json!({"model":"test-model","stream":true,"max_tokens":1024}),
         ))
         .respond_with(
             ResponseTemplate::new(200)
@@ -172,7 +174,8 @@ async fn anthropic_sdk_honors_custom_origin_headers_and_streams() {
         .and(body_partial_json(serde_json::json!({
             "model":"test-model",
             "stream":true,
-            "system":"system rules"
+            "system":"system rules",
+            "max_tokens":1024
         })))
         .respond_with(
             ResponseTemplate::new(200)

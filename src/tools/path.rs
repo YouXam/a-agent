@@ -2,7 +2,7 @@ use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-pub fn workspace_path(root: &Path, requested: &str, must_exist: bool) -> Result<PathBuf> {
+pub fn unrestricted_path(root: &Path, requested: &str, must_exist: bool) -> Result<PathBuf> {
     let root = root
         .canonicalize()
         .with_context(|| format!("resolve workspace {}", root.display()))?;
@@ -12,37 +12,13 @@ pub fn workspace_path(root: &Path, requested: &str, must_exist: bool) -> Result<
     } else {
         normalize(&root.join(requested))?
     };
-    if !candidate.starts_with(&root) {
-        anyhow::bail!("path is outside the workspace: {}", requested.display());
-    }
-
     if must_exist {
-        let resolved = candidate
+        candidate
             .canonicalize()
-            .with_context(|| format!("resolve path {}", requested.display()))?;
-        if !resolved.starts_with(&root) {
-            anyhow::bail!(
-                "path resolves outside the workspace: {}",
-                requested.display()
-            );
-        }
-        return Ok(resolved);
+            .with_context(|| format!("resolve path {}", requested.display()))
+    } else {
+        Ok(candidate)
     }
-
-    let mut ancestor = candidate.as_path();
-    while !ancestor.exists() {
-        ancestor = ancestor
-            .parent()
-            .context("path has no existing parent inside workspace")?;
-    }
-    let resolved_parent = ancestor.canonicalize()?;
-    if !resolved_parent.starts_with(&root) {
-        anyhow::bail!(
-            "path resolves outside the workspace: {}",
-            requested.display()
-        );
-    }
-    Ok(candidate)
 }
 
 fn normalize(path: &Path) -> Result<PathBuf> {

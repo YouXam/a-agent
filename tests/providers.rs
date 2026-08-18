@@ -11,7 +11,7 @@ fn responses_normalizes_text_reasoning_tools_and_usage() {
         json!({"type":"response.function_call_arguments.delta","item_id":"item_1","delta":"{\"path\":"}),
         json!({"type":"response.function_call_arguments.delta","item_id":"item_1","delta":"\"a.rs\"}"}),
         json!({"type":"response.output_item.done","item":{"type":"function_call","id":"item_1","call_id":"call_1","name":"read","arguments":"{\"path\":\"a.rs\"}"}}),
-        json!({"type":"response.completed","response":{"usage":{"input_tokens":10,"output_tokens":4,"input_tokens_details":{"cached_tokens":3}}}}),
+        json!({"type":"response.completed","response":{"usage":{"input_tokens":10,"output_tokens":4,"total_tokens":14,"input_tokens_details":{"cached_tokens":3,"cache_write_tokens":2}}}}),
     ];
     let (turn, events) = responses::normalize_events(values).unwrap();
     assert_eq!(turn.tool_calls[0].arguments, "{\"path\":\"a.rs\"}");
@@ -20,7 +20,13 @@ fn responses_normalizes_text_reasoning_tools_and_usage() {
             .iter()
             .any(|block| matches!(block, ContentBlock::Text(text) if text == "done"))
     );
-    assert_eq!(turn.usage.unwrap().cached_tokens, Some(3));
+    let usage = turn.usage.unwrap();
+    assert_eq!(usage.input_tokens, Some(5));
+    assert_eq!(usage.output_tokens, Some(4));
+    assert_eq!(usage.cached_tokens, Some(3));
+    assert_eq!(usage.cache_write_tokens, Some(2));
+    assert_eq!(usage.total_tokens, Some(14));
+    assert_eq!(usage.context_tokens(), Some(14));
     assert!(
         events
             .iter()
@@ -31,7 +37,7 @@ fn responses_normalizes_text_reasoning_tools_and_usage() {
 #[test]
 fn anthropic_normalizes_fragmented_tool_json() {
     let values = vec![
-        json!({"type":"message_start","message":{"usage":{"input_tokens":8,"cache_read_input_tokens":2}}}),
+        json!({"type":"message_start","message":{"usage":{"input_tokens":8,"cache_read_input_tokens":2,"cache_creation_input_tokens":3}}}),
         json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}),
         json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"plan"}}),
         json!({"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"tool_1","name":"bash","input":{}}}),
@@ -43,14 +49,20 @@ fn anthropic_normalizes_fragmented_tool_json() {
     ];
     let (turn, _) = anthropic::normalize_events(values).unwrap();
     assert_eq!(turn.tool_calls[0].arguments, "{\"command\":\"pwd\"}");
-    assert_eq!(turn.usage.unwrap().input_tokens, Some(8));
+    let usage = turn.usage.unwrap();
+    assert_eq!(usage.input_tokens, Some(8));
+    assert_eq!(usage.output_tokens, Some(5));
+    assert_eq!(usage.cached_tokens, Some(2));
+    assert_eq!(usage.cache_write_tokens, Some(3));
+    assert_eq!(usage.total_tokens, Some(18));
+    assert_eq!(usage.context_tokens(), Some(18));
 }
 
 #[test]
 fn chat_completion_normalizes_indexed_tool_deltas_and_reasoning() {
     let values = vec![
         json!({"choices":[{"delta":{"reasoning_content":"think","tool_calls":[{"index":0,"id":"call_1","function":{"name":"read","arguments":"{\"pa"}}]}}]}),
-        json!({"choices":[{"delta":{"content":"ok","tool_calls":[{"index":0,"function":{"arguments":"th\":\"x\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":3,"completion_tokens":6,"prompt_tokens_details":{"cached_tokens":1}}}),
+        json!({"choices":[{"delta":{"content":"ok","tool_calls":[{"index":0,"function":{"arguments":"th\":\"x\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":8,"completion_tokens":6,"total_tokens":14,"prompt_tokens_details":{"cached_tokens":3,"cache_write_tokens":2}}}),
     ];
     let (turn, events) = chat_completion::normalize_events(values).unwrap();
     assert_eq!(turn.tool_calls[0].arguments, "{\"path\":\"x\"}");
@@ -64,6 +76,25 @@ fn chat_completion_normalizes_indexed_tool_deltas_and_reasoning() {
             .iter()
             .any(|event| matches!(event, StreamEvent::ReasoningDelta { .. }))
     );
+    let usage = turn.usage.unwrap();
+    assert_eq!(usage.input_tokens, Some(3));
+    assert_eq!(usage.output_tokens, Some(6));
+    assert_eq!(usage.cached_tokens, Some(3));
+    assert_eq!(usage.cache_write_tokens, Some(2));
+    assert_eq!(usage.total_tokens, Some(14));
+    assert_eq!(usage.context_tokens(), Some(14));
+}
+
+#[test]
+fn usage_context_fallback_includes_cache_tokens() {
+    let usage = a_agent::model::Usage {
+        input_tokens: Some(11),
+        output_tokens: Some(7),
+        cached_tokens: Some(5),
+        cache_write_tokens: Some(3),
+        total_tokens: None,
+    };
+    assert_eq!(usage.context_tokens(), Some(26));
 }
 
 #[test]

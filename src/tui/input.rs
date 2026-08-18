@@ -1,23 +1,80 @@
+use std::borrow::Cow;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use dialoguer::Select;
+use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
+use rustyline::highlight::Highlighter;
+use rustyline::hint::Hinter;
+use rustyline::history::DefaultHistory;
+use rustyline::validate::Validator;
 use rustyline::{
-    Cmd, ConditionalEventHandler, DefaultEditor, Event, EventContext, EventHandler, KeyCode,
-    KeyEvent, Modifiers, RepeatCount,
+    Cmd, ConditionalEventHandler, Context, Editor, Event, EventContext, EventHandler, Helper,
+    KeyCode, KeyEvent, Modifiers, RepeatCount,
 };
+use unicode_width::UnicodeWidthStr;
 
 use super::InlineRenderer;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputAction {
-    Submit(String),
+    Submit(String, InputMode),
     Rewind,
     ToggleReasoning,
     Interrupt,
     Eof,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputMode {
+    Once,
+    Multi,
+}
+
+#[derive(Clone)]
+struct AgentHelper {
+    multi: Arc<AtomicBool>,
+}
+
+impl Completer for AgentHelper {
+    type Candidate = Pair;
+}
+
+impl Hinter for AgentHelper {
+    type Hint = String;
+
+    fn hint(&self, line: &str, position: usize, _context: &Context<'_>) -> Option<String> {
+        if position != line.len() {
+            return None;
+        }
+        let label = if self.multi.load(Ordering::SeqCst) {
+            "multi · tab"
+        } else {
+            "once · tab"
+        };
+        let terminal_width = crossterm::terminal::size()
+            .map(|(width, _)| usize::from(width))
+            .unwrap_or(80);
+        let used = 3 + UnicodeWidthStr::width(line) + UnicodeWidthStr::width(label);
+        (terminal_width > used + 1)
+            .then(|| format!("{}{label}", " ".repeat(terminal_width - used - 1)))
+    }
+}
+
+impl Highlighter for AgentHelper {
+    fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
+        if self.multi.load(Ordering::SeqCst) {
+            Cow::Owned(format!("\x1b[1;95m{hint}\x1b[0m"))
+        } else {
+            Cow::Owned(format!("\x1b[90m{hint}\x1b[0m"))
+        }
+    }
+}
+
+impl Validator for AgentHelper {}
+impl Helper for AgentHelper {}
 
 struct RewindHandler(Arc<AtomicBool>);
 
@@ -53,12 +110,28 @@ impl ConditionalEventHandler for ReasoningHandler {
     }
 }
 
+struct ModeHandler(Arc<AtomicBool>);
+
+impl ConditionalEventHandler for ModeHandler {
+    fn handle(
+        &self,
+        _event: &Event,
+        _repeat: RepeatCount,
+        _positive: bool,
+        _context: &EventContext,
+    ) -> Option<Cmd> {
+        self.0.fetch_xor(true, Ordering::SeqCst);
+        Some(Cmd::Repaint)
+    }
+}
+
 pub struct InputEditor {
-    editor: DefaultEditor,
+    editor: Editor<AgentHelper, DefaultHistory>,
     rewind_requested: Arc<AtomicBool>,
     reasoning_requested: Arc<Mutex<Option<(String, String)>>>,
     pending_initial: Option<(String, String)>,
     reasoning_key: char,
+    multi: Arc<AtomicBool>,
 }
 
 impl InputEditor {
@@ -78,7 +151,15 @@ impl InputEditor {
             })?;
         let rewind_requested = Arc::new(AtomicBool::new(false));
         let reasoning_requested = Arc::new(Mutex::new(None));
-        let mut editor = DefaultEditor::new().map_err(io::Error::other)?;
+        let multi = Arc::new(AtomicBool::new(true));
+        let editor_config = rustyline::Config::builder()
+            .keyseq_timeout(Some(500))
+            .build();
+        let mut editor = Editor::<AgentHelper, DefaultHistory>::with_config(editor_config)
+            .map_err(io::Error::other)?;
+        editor.set_helper(Some(AgentHelper {
+            multi: multi.clone(),
+        }));
         editor.bind_sequence(
             Event::KeySeq(vec![KeyEvent::from('\x1b'), KeyEvent::from('\x1b')]),
             EventHandler::Conditional(Box::new(RewindHandler(rewind_requested.clone()))),
@@ -95,12 +176,17 @@ impl InputEditor {
             KeyEvent::ctrl(reasoning_key),
             EventHandler::Conditional(Box::new(ReasoningHandler(reasoning_requested.clone()))),
         );
+        editor.bind_sequence(
+            KeyEvent(KeyCode::Tab, Modifiers::NONE),
+            EventHandler::Conditional(Box::new(ModeHandler(multi.clone()))),
+        );
         Ok(Self {
             editor,
             rewind_requested,
             reasoning_requested,
             pending_initial: None,
             reasoning_key,
+            multi,
         })
     }
 
@@ -118,7 +204,7 @@ impl InputEditor {
     }
 
     pub fn read_action(&mut self) -> io::Result<InputAction> {
-        let prompt = ("a> ", "\x1b[1;36ma> \x1b[0m");
+        let prompt = ("a> ", "\x1b[1;96ma> \x1b[0m");
         let result = if let Some((left, right)) = self.pending_initial.take() {
             self.editor.readline_with_initial(&prompt, (&left, &right))
         } else {
@@ -131,7 +217,12 @@ impl InputEditor {
                         .add_history_entry(line.as_str())
                         .map_err(io::Error::other)?;
                 }
-                Ok(InputAction::Submit(line))
+                let mode = if self.multi.load(Ordering::SeqCst) {
+                    InputMode::Multi
+                } else {
+                    InputMode::Once
+                };
+                Ok(InputAction::Submit(line, mode))
             }
             Err(ReadlineError::Interrupted)
                 if self.rewind_requested.swap(false, Ordering::SeqCst) =>
@@ -145,6 +236,32 @@ impl InputEditor {
             Err(ReadlineError::Eof) => Ok(InputAction::Eof),
             Err(error) => Err(io::Error::other(error)),
         }
+    }
+
+    pub fn add_history_entries(&mut self, entries: &[String]) -> io::Result<()> {
+        for entry in entries {
+            self.editor
+                .add_history_entry(entry.as_str())
+                .map_err(io::Error::other)?;
+        }
+        Ok(())
+    }
+
+    pub fn select_option(
+        &mut self,
+        prompt: &str,
+        choices: &[String],
+        default: usize,
+    ) -> io::Result<Option<usize>> {
+        if choices.is_empty() {
+            return Ok(None);
+        }
+        Select::new()
+            .with_prompt(prompt)
+            .items(choices)
+            .default(default.min(choices.len() - 1))
+            .interact_opt()
+            .map_err(io::Error::other)
     }
 
     fn take_reasoning_request(&mut self) -> bool {

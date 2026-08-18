@@ -1,9 +1,11 @@
 use std::sync::{Arc, Mutex};
 
 use a_agent::agent::Agent;
-use a_agent::model::{ContentBlock, ModelRequest, ModelTurn, Role, ToolCall, ToolResult};
+use a_agent::model::{ContentBlock, ModelRequest, ModelTurn, Role, ToolCall, ToolResult, Usage};
 use a_agent::provider::{EventSink, Provider};
-use a_agent::session::{NewSession, SessionStore, TURN_INTERRUPTED_NOTICE};
+use a_agent::session::{
+    CONVERSATION_SUMMARY_PREFIX, NewSession, SessionStore, TURN_INTERRUPTED_NOTICE,
+};
 use a_agent::tools::runner::{ToolExecutor, ToolRunner};
 use async_trait::async_trait;
 use rusqlite::Connection;
@@ -43,6 +45,64 @@ fn sessions_resume_by_cwd_and_reconstruct_active_branch() {
             .collect::<Vec<_>>(),
         [user.id, assistant.id]
     );
+}
+
+#[test]
+fn assistant_usage_survives_database_reopen() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("sessions.db");
+    let session_id = {
+        let mut store = SessionStore::open(&path).unwrap();
+        let session = store
+            .create_session(NewSession::new("/repo", "responses", "model"))
+            .unwrap();
+        store
+            .append_assistant_item(
+                &session.id,
+                vec![ContentBlock::Text("answer".into())],
+                Some(Usage {
+                    input_tokens: Some(11),
+                    output_tokens: Some(7),
+                    cached_tokens: Some(5),
+                    cache_write_tokens: Some(3),
+                    total_tokens: Some(26),
+                }),
+            )
+            .unwrap();
+        session.id
+    };
+
+    let store = SessionStore::open(&path).unwrap();
+    let branch = store.active_branch(&session_id).unwrap();
+    assert_eq!(branch[0].usage.unwrap().context_tokens(), Some(26));
+}
+
+#[test]
+fn session_persists_model_profile_and_effort_changes() {
+    let mut store = SessionStore::open_in_memory().unwrap();
+    let session = store
+        .create_session(
+            NewSession::new("/repo", "responses", "gpt-fast")
+                .with_model_selection("fast", Some("low")),
+        )
+        .unwrap();
+    assert_eq!(session.model_profile.as_deref(), Some("fast"));
+    assert_eq!(session.effort.as_deref(), Some("low"));
+
+    store
+        .update_model_selection(
+            &session.id,
+            "anthropic",
+            "claude-deep",
+            "claude",
+            Some("high"),
+        )
+        .unwrap();
+    let resumed = store.get_session(&session.id).unwrap().unwrap();
+    assert_eq!(resumed.provider_type, "anthropic");
+    assert_eq!(resumed.model, "claude-deep");
+    assert_eq!(resumed.model_profile.as_deref(), Some("claude"));
+    assert_eq!(resumed.effort.as_deref(), Some("high"));
 }
 
 #[test]
@@ -87,6 +147,42 @@ fn client_sessions_are_isolated_by_fish_key_and_cwd() {
             .unwrap()
             .id,
         other_cwd.id
+    );
+}
+
+#[test]
+fn recent_sessions_can_rebind_the_current_fish_key() {
+    let mut store = SessionStore::open_in_memory().unwrap();
+    let original = store
+        .create_session(
+            NewSession::new("/repo", "responses", "first").with_client_session_key("fish-one"),
+        )
+        .unwrap();
+    let target = store
+        .create_session(NewSession::new("/repo", "anthropic", "second"))
+        .unwrap();
+    store
+        .create_session(NewSession::new("/other", "responses", "other"))
+        .unwrap();
+
+    let recent = store.recent_sessions("/repo", 10).unwrap();
+    assert_eq!(
+        recent
+            .iter()
+            .map(|session| session.id.as_str())
+            .collect::<Vec<_>>(),
+        [target.id.as_str(), original.id.as_str()]
+    );
+    store
+        .rebind_client_session_key("/repo", "fish-one", &target.id)
+        .unwrap();
+    assert_eq!(
+        store
+            .find_client_session("/repo", "fish-one")
+            .unwrap()
+            .unwrap()
+            .id,
+        target.id
     );
 }
 
@@ -224,6 +320,23 @@ fn shell_history_can_be_scoped_to_one_fish_session() {
 }
 
 #[test]
+fn input_history_is_global_chronological_and_bounded() {
+    let store = SessionStore::open_in_memory().unwrap();
+    for entry in ["first prompt", "second prompt", "third prompt"] {
+        store.record_input_history(entry).unwrap();
+    }
+    assert_eq!(
+        store.recent_input_history(2).unwrap(),
+        ["second prompt", "third prompt"]
+    );
+    store.prune_input_history(2).unwrap();
+    assert_eq!(
+        store.recent_input_history(10).unwrap(),
+        ["second prompt", "third prompt"]
+    );
+}
+
+#[test]
 fn opening_a_v1_database_adds_client_session_columns() {
     let temp = tempdir().unwrap();
     let path = temp.path().join("sessions.db");
@@ -352,4 +465,258 @@ async fn one_logical_turn_runs_tools_until_final_response() {
             .collect::<Vec<_>>(),
         [Role::User, Role::Assistant, Role::Tool, Role::Assistant]
     );
+}
+
+#[tokio::test]
+async fn auto_compaction_uses_persisted_provider_usage_as_its_token_anchor() {
+    let provider = Arc::new(SequenceProvider {
+        turns: Mutex::new(vec![
+            ModelTurn::text("durable summary"),
+            ModelTurn::text("answer"),
+        ]),
+        request_count: AtomicCounter::default(),
+    });
+    let tools = Arc::new(ToolRunner::new(Arc::new(FakeTools), 8));
+    let store = Arc::new(Mutex::new(SessionStore::open_in_memory().unwrap()));
+    let session = store
+        .lock()
+        .unwrap()
+        .create_session(NewSession::new("/repo", "responses", "model"))
+        .unwrap();
+    store
+        .lock()
+        .unwrap()
+        .append_item(
+            &session.id,
+            Role::User,
+            vec![ContentBlock::Text("old request".into())],
+        )
+        .unwrap();
+    store
+        .lock()
+        .unwrap()
+        .append_assistant_item(
+            &session.id,
+            vec![ContentBlock::Text("old answer".into())],
+            Some(Usage {
+                total_tokens: Some(90),
+                ..Usage::default()
+            }),
+        )
+        .unwrap();
+    let agent = Agent::new(
+        provider.clone(),
+        tools,
+        store.clone(),
+        session.id.clone(),
+        "system".into(),
+        10,
+    )
+    .with_context_budget(Some(100), 20);
+
+    let result = agent
+        .submit(
+            "new request",
+            EventSink::default(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.final_text.as_deref(), Some("answer"));
+    assert_eq!(
+        provider
+            .request_count
+            .0
+            .load(std::sync::atomic::Ordering::SeqCst),
+        2
+    );
+    let branch = store.lock().unwrap().active_branch(&session.id).unwrap();
+    let texts = branch
+        .iter()
+        .flat_map(|item| &item.blocks)
+        .filter_map(|block| match block {
+            ContentBlock::Text(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        texts[0].starts_with(CONVERSATION_SUMMARY_PREFIX),
+        "{texts:?}"
+    );
+    assert!(texts.contains(&"new request"), "{texts:?}");
+    assert!(texts.contains(&"answer"), "{texts:?}");
+    assert!(!texts.contains(&"old request"), "{texts:?}");
+}
+
+#[tokio::test]
+async fn auto_compaction_does_not_reestimate_history_before_a_valid_usage_anchor() {
+    let provider = Arc::new(SequenceProvider {
+        turns: Mutex::new(vec![ModelTurn::text("answer")]),
+        request_count: AtomicCounter::default(),
+    });
+    let tools = Arc::new(ToolRunner::new(Arc::new(FakeTools), 8));
+    let store = Arc::new(Mutex::new(SessionStore::open_in_memory().unwrap()));
+    let session = store
+        .lock()
+        .unwrap()
+        .create_session(NewSession::new("/repo", "responses", "model"))
+        .unwrap();
+    store
+        .lock()
+        .unwrap()
+        .append_item(
+            &session.id,
+            Role::User,
+            vec![ContentBlock::Text("x".repeat(10_000))],
+        )
+        .unwrap();
+    store
+        .lock()
+        .unwrap()
+        .append_assistant_item(
+            &session.id,
+            vec![ContentBlock::Text("old answer".into())],
+            Some(Usage {
+                total_tokens: Some(20),
+                ..Usage::default()
+            }),
+        )
+        .unwrap();
+    let agent = Agent::new(
+        provider.clone(),
+        tools,
+        store.clone(),
+        session.id.clone(),
+        "system".into(),
+        10,
+    )
+    .with_context_budget(Some(100), 20);
+
+    let result = agent
+        .submit(
+            "small follow-up",
+            EventSink::default(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.final_text.as_deref(), Some("answer"));
+    assert_eq!(
+        provider
+            .request_count
+            .0
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    let branch = store.lock().unwrap().active_branch(&session.id).unwrap();
+    assert!(branch.iter().any(|item| {
+        item.blocks
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Text(text) if text.len() == 10_000))
+    }));
+}
+
+#[tokio::test]
+async fn auto_compaction_ignores_all_zero_usage() {
+    let provider = Arc::new(SequenceProvider {
+        turns: Mutex::new(vec![
+            ModelTurn::text("durable summary"),
+            ModelTurn::text("answer"),
+        ]),
+        request_count: AtomicCounter::default(),
+    });
+    let tools = Arc::new(ToolRunner::new(Arc::new(FakeTools), 8));
+    let store = Arc::new(Mutex::new(SessionStore::open_in_memory().unwrap()));
+    let session = store
+        .lock()
+        .unwrap()
+        .create_session(NewSession::new("/repo", "responses", "model"))
+        .unwrap();
+    store
+        .lock()
+        .unwrap()
+        .append_assistant_item(
+            &session.id,
+            vec![ContentBlock::Text("x".repeat(400))],
+            Some(Usage::default()),
+        )
+        .unwrap();
+    let agent = Agent::new(
+        provider.clone(),
+        tools,
+        store.clone(),
+        session.id.clone(),
+        "system".into(),
+        10,
+    )
+    .with_context_budget(Some(100), 20);
+
+    agent
+        .submit("continue", EventSink::default(), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        provider
+            .request_count
+            .0
+            .load(std::sync::atomic::Ordering::SeqCst),
+        2
+    );
+    let branch = store.lock().unwrap().active_branch(&session.id).unwrap();
+    assert!(is_summary(&branch[0].blocks));
+}
+
+#[tokio::test]
+async fn manual_compaction_replaces_the_active_branch_without_an_agent_turn() {
+    let provider = Arc::new(SequenceProvider {
+        turns: Mutex::new(vec![ModelTurn::text("manual summary")]),
+        request_count: AtomicCounter::default(),
+    });
+    let tools = Arc::new(ToolRunner::new(Arc::new(FakeTools), 8));
+    let store = Arc::new(Mutex::new(SessionStore::open_in_memory().unwrap()));
+    let session = store
+        .lock()
+        .unwrap()
+        .create_session(NewSession::new("/repo", "responses", "model"))
+        .unwrap();
+    store
+        .lock()
+        .unwrap()
+        .append_item(
+            &session.id,
+            Role::User,
+            vec![ContentBlock::Text("keep this context".into())],
+        )
+        .unwrap();
+    let agent = Agent::new(
+        provider.clone(),
+        tools,
+        store.clone(),
+        session.id.clone(),
+        "system".into(),
+        10,
+    );
+
+    assert!(
+        agent
+            .compact(EventSink::default(), CancellationToken::new())
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        provider
+            .request_count
+            .0
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    let branch = store.lock().unwrap().active_branch(&session.id).unwrap();
+    assert_eq!(branch.len(), 1);
+    assert!(is_summary(&branch[0].blocks));
+}
+
+fn is_summary(blocks: &[ContentBlock]) -> bool {
+    blocks.iter().any(
+        |block| matches!(block, ContentBlock::Text(text) if text.starts_with(CONVERSATION_SUMMARY_PREFIX)),
+    )
 }

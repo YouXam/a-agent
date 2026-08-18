@@ -69,9 +69,10 @@ fn transcript_is_append_only_aligned_and_colored() {
     assert!(
         plain
             .lines()
-            .any(|line| line.starts_with("● read  src/main.rs  from line 11")),
+            .any(|line| line.starts_with("✓ read  src/main.rs  from line 11 · 1 line")),
         "{plain}"
     );
+    assert!(!plain.contains("● read"), "{plain}");
     assert!(!plain.lines().any(|line| line.trim() == "input"));
     assert!(!plain.lines().any(|line| line.trim() == "output"));
     assert!(plain.contains("1: code"));
@@ -113,7 +114,7 @@ fn apply_patch_renders_file_operations_and_diff_summary() {
         ),
     });
     let plain = String::from_utf8(writer.bytes()).unwrap();
-    assert!(plain.lines().any(|line| line == "● apply_patch"), "{plain}");
+    assert!(!plain.contains("● apply_patch"), "{plain}");
     assert!(
         plain.lines().any(|line| line == "  M src/parser.rs"),
         "{plain}"
@@ -125,6 +126,9 @@ fn apply_patch_renders_file_operations_and_diff_summary() {
     assert!(!plain.lines().any(|line| line.trim() == "input"));
     assert!(!plain.lines().any(|line| line.trim() == "output"));
     assert!(plain.contains("✓ apply_patch  2 files  +2 -1"), "{plain}");
+    let status = plain.find("✓ apply_patch").unwrap();
+    let operation = plain.find("  M src/parser.rs").unwrap();
+    assert!(status < operation, "{plain}");
 }
 
 #[test]
@@ -139,7 +143,7 @@ fn failed_apply_patch_reports_failure_instead_of_file_count() {
     sink.emit(StreamEvent::ToolCallArgsDelta {
         id: "patch-fail".into(),
         delta: serde_json::json!({
-            "patch": "*** Begin Patch\n*** Update File: /tmp/outside.rs\n@@\n-old\n+new\n*** End Patch"
+            "patch": "*** Begin Patch\n*** Update File: /read-only/parser.rs\n@@\n-old\n+new\n*** End Patch"
         })
         .to_string(),
     });
@@ -148,11 +152,45 @@ fn failed_apply_patch_reports_failure_instead_of_file_count() {
     });
     sink.emit(StreamEvent::ToolExecutionEnd {
         id: "patch-fail".into(),
-        result: ToolResult::error("patch-fail", "patch path is outside the workspace"),
+        result: ToolResult::error("patch-fail", "permission denied"),
     });
     let plain = String::from_utf8(writer.bytes()).unwrap();
     assert!(plain.contains("× apply_patch  failed"), "{plain}");
+    assert!(!plain.contains("● apply_patch"), "{plain}");
     assert!(!plain.contains("× apply_patch  1 files"), "{plain}");
+}
+
+#[test]
+fn failed_read_uses_one_final_status_before_the_error() {
+    let writer = SharedWriter::default();
+    let renderer = InlineRenderer::new(writer.clone(), false, false);
+    let sink = renderer.event_sink();
+    sink.emit(StreamEvent::ToolCallStart {
+        id: "read-fail".into(),
+        name: "read".into(),
+    });
+    sink.emit(StreamEvent::ToolCallArgsDelta {
+        id: "read-fail".into(),
+        delta: serde_json::json!({"path":"/missing/file.rs"}).to_string(),
+    });
+    sink.emit(StreamEvent::ToolCallEnd {
+        id: "read-fail".into(),
+    });
+    sink.emit(StreamEvent::ToolExecutionEnd {
+        id: "read-fail".into(),
+        result: ToolResult::error("read-fail", "file not found"),
+    });
+
+    let plain = String::from_utf8(writer.bytes()).unwrap();
+    assert!(
+        plain.contains("× read  /missing/file.rs · failed"),
+        "{plain}"
+    );
+    assert!(!plain.contains("● read"), "{plain}");
+    assert!(
+        plain.find("× read").unwrap() < plain.find("file not found").unwrap(),
+        "{plain}"
+    );
 }
 
 #[test]

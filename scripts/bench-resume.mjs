@@ -52,11 +52,14 @@ if (!address || typeof address === "string") {
 
 fs.writeFileSync(
   path.join(home, ".config/a/config.toml"),
-  `[provider]\n` +
+  `default_model = "benchmark"\n` +
+    `[providers.benchmark]\n` +
     `type = "responses"\n` +
     `base_url = "http://127.0.0.1:${address.port}/v1"\n` +
-    `model = "benchmark-model"\n` +
-    `api_key = "benchmark-key"\n`,
+    `api_key = "benchmark-key"\n` +
+    `[models.benchmark]\n` +
+    `provider = "benchmark"\n` +
+    `model = "benchmark-model"\n`,
 );
 
 function runAgent(args, stateHome, debugTiming = false) {

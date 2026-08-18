@@ -9,7 +9,27 @@ use a_agent::context::{
 use tempfile::tempdir;
 
 #[test]
-fn loads_layered_config_with_third_party_provider_settings() {
+fn rejects_legacy_single_provider_configuration() {
+    let temp = tempdir().unwrap();
+    let home = temp.path().join("home");
+    let cwd = temp.path().join("repo");
+    fs::create_dir_all(home.join(".config/a")).unwrap();
+    fs::create_dir_all(&cwd).unwrap();
+    fs::write(
+        home.join(".config/a/config.toml"),
+        r#"
+[provider]
+type = "responses"
+model = "old-model"
+"#,
+    )
+    .unwrap();
+    let error = Config::load_from(&cwd, &home).unwrap_err().to_string();
+    assert!(error.contains("legacy [provider]"), "{error}");
+}
+
+#[test]
+fn resolves_multiple_provider_and_model_profiles_with_effort() {
     let temp = tempdir().unwrap();
     let home = temp.path().join("home");
     let cwd = temp.path().join("repo");
@@ -18,62 +38,127 @@ fn loads_layered_config_with_third_party_provider_settings() {
     fs::write(
         home.join(".config/a/config.toml"),
         r#"
-[provider]
+default_model = "fast"
+
+[providers.openai]
 type = "responses"
-model = "global-model"
-api_key_env = "CUSTOM_KEY"
-api_key = "direct-secret"
-base_url = "https://gateway.example/v1"
+base_url = "https://openai.example/v1"
+api_key = "openai-secret"
 
-[provider.headers]
-X-Tenant = "acme"
+[providers.claude]
+type = "anthropic"
+base_url = "https://anthropic.example"
+api_key = "claude-secret"
 
-[provider.request]
+[models.fast]
+provider = "openai"
+model = "gpt-fast"
+effort = "low"
+efforts = ["low", "medium", "high"]
+context_window = 128000
+max_tokens = 4096
+
+[models.deep]
+provider = "openai"
+model = "gpt-deep"
+effort = "high"
+efforts = ["medium", "high", "max"]
+
+[models.deep.request]
 service_tier = "priority"
 
-[tools]
-max_parallel = 3
-
-[ui]
-tool_input_max_bytes = 1200
-tool_output_max_bytes = 2400
-tool_output_max_lines = 9
-tool_live_output_lines = 4
+[models.claude]
+provider = "claude"
+model = "claude-deep"
+effort = "high"
+efforts = ["low", "medium", "high", "max"]
 "#,
     )
     .unwrap();
     fs::write(
         cwd.join(".a/config.toml"),
-        "[provider]\nmodel = \"project-model\"\n",
+        "[models.deep]\neffort = \"medium\"\n",
     )
     .unwrap();
 
     let config = Config::load_from(&cwd, &home).unwrap();
-    assert_eq!(config.provider.kind, ProviderKind::Responses);
-    assert_eq!(config.provider.model, "project-model");
-    assert_eq!(
-        config.provider.base_url.as_deref(),
-        Some("https://gateway.example/v1")
-    );
-    assert_eq!(config.provider.api_key_env, "CUSTOM_KEY");
-    assert_eq!(
-        config
-            .provider
-            .resolve_api_key_with(|_| panic!("environment must not be read"))
-            .unwrap(),
-        "direct-secret"
-    );
-    assert!(!format!("{config:?}").contains("direct-secret"));
-    assert_eq!(
-        config.provider.headers.get("X-Tenant").map(String::as_str),
-        Some("acme")
-    );
-    assert_eq!(config.tools.max_parallel, 3);
-    assert_eq!(config.ui.tool_input_max_bytes, 1200);
-    assert_eq!(config.ui.tool_output_max_bytes, 2400);
-    assert_eq!(config.ui.tool_output_max_lines, 9);
-    assert_eq!(config.ui.tool_live_output_lines, 4);
-    assert_eq!(config.provider.request["service_tier"], "priority");
+    assert_eq!(config.model_names(), ["claude", "deep", "fast"]);
+
+    let fast = config.resolve_model(None, None).unwrap();
+    assert_eq!(fast.name, "fast");
+    assert_eq!(fast.provider_name, "openai");
+    assert_eq!(fast.provider.kind, ProviderKind::Responses);
+    assert_eq!(fast.provider.model, "gpt-fast");
+    assert_eq!(fast.provider.max_tokens, 4096);
+    assert_eq!(fast.context_window, Some(128000));
+    assert_eq!(fast.effort.as_deref(), Some("low"));
+    assert_eq!(fast.provider.request["reasoning"]["effort"], "low");
+
+    let deep = config.resolve_model(Some("deep"), Some("high")).unwrap();
+    assert_eq!(deep.provider.model, "gpt-deep");
+    assert_eq!(deep.effort.as_deref(), Some("high"));
+    assert_eq!(deep.provider.request["reasoning"]["effort"], "high");
+    assert_eq!(deep.provider.request["service_tier"], "priority");
+
+    let claude = config.resolve_model(Some("claude"), Some("max")).unwrap();
+    assert_eq!(claude.provider.kind, ProviderKind::Anthropic);
+    assert_eq!(claude.provider.request["output_config"]["effort"], "max");
+}
+
+#[test]
+fn model_without_effort_does_not_inject_reasoning_configuration() {
+    let temp = tempdir().unwrap();
+    let home = temp.path().join("home");
+    let cwd = temp.path().join("repo");
+    fs::create_dir_all(home.join(".config/a")).unwrap();
+    fs::create_dir_all(&cwd).unwrap();
+    fs::write(
+        home.join(".config/a/config.toml"),
+        r#"
+default_model = "plain"
+[providers.internal]
+type = "responses"
+api_key = "secret"
+[models.plain]
+provider = "internal"
+model = "provider-model"
+"#,
+    )
+    .unwrap();
+    let config = Config::load_from(&cwd, &home).unwrap();
+    let model = config.resolve_model(None, None).unwrap();
+    assert_eq!(model.effort, None);
+    assert!(model.efforts.is_empty());
+    assert!(!model.provider.request.contains_key("reasoning"));
+    assert!(config.resolve_model(None, Some("high")).is_err());
+}
+
+#[test]
+fn context_window_must_leave_room_for_model_output() {
+    let temp = tempdir().unwrap();
+    let home = temp.path().join("home");
+    let cwd = temp.path().join("repo");
+    fs::create_dir_all(home.join(".config/a")).unwrap();
+    fs::create_dir_all(&cwd).unwrap();
+    fs::write(
+        home.join(".config/a/config.toml"),
+        r#"
+default_model = "invalid"
+[providers.test]
+type = "responses"
+api_key = "secret"
+max_tokens = 4096
+[models.invalid]
+provider = "test"
+model = "test-model"
+context_window = 4096
+"#,
+    )
+    .unwrap();
+
+    let error = Config::load_from(&cwd, &home).unwrap_err().to_string();
+    assert!(error.contains("context_window"), "{error}");
+    assert!(error.contains("max_tokens"), "{error}");
 }
 
 #[test]
@@ -83,11 +168,14 @@ fn first_run_creates_a_documented_global_config_without_overwriting_it() {
     let path = Config::ensure_user_config(&home).unwrap().unwrap();
     assert_eq!(path, home.join(".config/a/config.toml"));
     let source = fs::read_to_string(&path).unwrap();
+    assert!(source.contains("default_model = \"codex\""));
+    assert!(source.contains("[providers.openai]"));
+    assert!(source.contains("[models.codex]"));
     assert!(source.contains("type = \"responses\""));
     assert!(source.contains("api_key_env = \"OPENAI_API_KEY\""));
     assert!(source.contains("# api_key = \"sk-...\""));
     assert!(source.contains("# base_url = \"https://gateway.example/v1\""));
-    assert!(source.contains("# type = \"anthropic\""));
+    assert!(source.contains("# [providers.anthropic]"));
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -203,8 +291,9 @@ fn system_prompt_has_active_rules_and_skill_references_only() {
     assert!(prompt.contains("Review code."));
     assert!(prompt.contains("/repo/.a/skills/review/SKILL.md"));
     assert!(prompt.contains("Targeted files:\n- /repo/src/a.rs"));
-    assert!(prompt.contains("relative to the cwd"));
+    assert!(prompt.contains("Relative read and apply_patch paths are resolved from the cwd"));
     assert!(prompt.contains("Before any git command, first confirm that .git exists"));
+    assert!(prompt.contains("Never inspect the workspace merely because it is available"));
     assert!(prompt.contains("Rust runtime injects recent records"));
     assert!(prompt.contains("integration lacks context injection"));
     assert!(!prompt.contains("SECRET BODY"));

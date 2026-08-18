@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use super::path::workspace_path;
+use super::path::unrestricted_path;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PatchSummary {
@@ -85,7 +85,7 @@ pub async fn apply_patch(root: &Path, patch: &str) -> Result<PatchSummary> {
         }
         match operation {
             Operation::Add { path, content } => {
-                let resolved = workspace_path(root, &path, false)?;
+                let resolved = unrestricted_path(root, &path, false)?;
                 if resolved.exists() {
                     anyhow::bail!("cannot add existing file: {path}");
                 }
@@ -101,7 +101,7 @@ pub async fn apply_patch(root: &Path, patch: &str) -> Result<PatchSummary> {
                 });
             }
             Operation::Delete { path } => {
-                let resolved = workspace_path(root, &path, true)?;
+                let resolved = unrestricted_path(root, &path, true)?;
                 let source = fs::read_to_string(&resolved)
                     .with_context(|| format!("read file before delete: {path}"))?;
                 prepared.push(Prepared::Delete {
@@ -114,7 +114,7 @@ pub async fn apply_patch(root: &Path, patch: &str) -> Result<PatchSummary> {
                 });
             }
             Operation::Update { path, hunks } => {
-                let resolved = workspace_path(root, &path, true)?;
+                let resolved = unrestricted_path(root, &path, true)?;
                 let source = fs::read_to_string(&resolved)
                     .with_context(|| format!("read file before update: {path}"))?;
                 let (content, added, removed) = apply_hunks(&source, &hunks, &path)?;
@@ -242,13 +242,8 @@ fn parse_patch(patch: &str) -> Result<Vec<Operation>> {
 }
 
 fn validate_patch_path(path: &str) -> Result<()> {
-    let path = Path::new(path);
-    if path.is_absolute()
-        || path
-            .components()
-            .any(|part| matches!(part, std::path::Component::ParentDir))
-    {
-        anyhow::bail!("patch path is outside the workspace: {}", path.display());
+    if path.trim().is_empty() {
+        anyhow::bail!("patch path must not be empty");
     }
     Ok(())
 }

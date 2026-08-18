@@ -15,6 +15,7 @@ use crate::model::{StreamEvent, ToolResult};
 use crate::provider::EventSink;
 
 const GENERATION_ID: &str = "__a_generation";
+const GENERATION_CONTENT_ID: &str = "__a_generation_content";
 
 #[derive(Debug, Clone, Copy)]
 pub struct RenderLimits {
@@ -47,6 +48,8 @@ struct State {
     reasoning_visible: bool,
     reasoning_announced: bool,
     reasoning_buffer: String,
+    reasoning_pending: String,
+    assistant_buffer: String,
     reasoning_at_line_start: bool,
     assistant_at_line_start: bool,
     tools: HashMap<String, ToolDisplay>,
@@ -57,7 +60,6 @@ struct ToolDisplay {
     name: String,
     arguments: BoundedInput,
     output: TailBuffer,
-    input_rendered: bool,
 }
 
 struct BoundedInput {
@@ -85,6 +87,7 @@ struct LiveTools {
     visible_lines: usize,
     terminal_width: usize,
     reserved: bool,
+    reserve_stdout_rows: bool,
 }
 
 impl InlineRenderer {
@@ -127,6 +130,8 @@ impl InlineRenderer {
                 reasoning_visible: show_reasoning,
                 reasoning_announced: false,
                 reasoning_buffer: String::new(),
+                reasoning_pending: String::new(),
+                assistant_buffer: String::new(),
                 reasoning_at_line_start: true,
                 assistant_at_line_start: true,
                 tools: HashMap::new(),
@@ -140,6 +145,8 @@ impl InlineRenderer {
             state.finish_open_lines()?;
             state.reasoning_announced = false;
             state.reasoning_buffer.clear();
+            state.reasoning_pending.clear();
+            state.assistant_buffer.clear();
             state.tools.clear();
             if let Some(live) = &mut state.live {
                 live.clear();
@@ -166,6 +173,7 @@ impl InlineRenderer {
 
     pub fn render_status(&self, message: &str) -> io::Result<()> {
         self.with_state(|state| {
+            state.flush_generation_pending()?;
             state.finish_generation();
             state.finish_open_lines()?;
             write_styled(
@@ -240,14 +248,13 @@ impl InlineRenderer {
 
     fn render_event(&self, event: StreamEvent) -> io::Result<()> {
         self.with_state(|state| {
-            if !matches!(&event, StreamEvent::GenerationStart) {
-                state.finish_generation();
-            }
             match event {
                 StreamEvent::GenerationStart => state.start_generation()?,
                 StreamEvent::ReasoningDelta { delta } => state.reasoning_delta(&delta)?,
                 StreamEvent::TextDelta { delta } => state.assistant_delta(&delta)?,
                 StreamEvent::ToolCallStart { id, name } => {
+                    state.flush_generation_pending()?;
+                    state.update_generation_message(&format!("generating  {name}"));
                     state.tools.insert(
                         id,
                         ToolDisplay::new(
@@ -274,6 +281,8 @@ impl InlineRenderer {
                     state.render_completed_tool(&id, &result)?;
                 }
                 StreamEvent::Error { message } => {
+                    state.flush_generation_pending()?;
+                    state.finish_generation();
                     state.finish_open_lines()?;
                     write_styled(
                         &mut state.writer,
@@ -284,9 +293,13 @@ impl InlineRenderer {
                     )?;
                 }
                 StreamEvent::Done => {
+                    state.flush_generation_pending()?;
+                    state.finish_generation();
                     state.finish_open_lines()?;
                     state.reasoning_announced = false;
                     state.reasoning_buffer.clear();
+                    state.reasoning_pending.clear();
+                    state.assistant_buffer.clear();
                 }
                 StreamEvent::Usage(_) => {}
             }
@@ -317,13 +330,43 @@ impl State {
         if let Some(live) = &mut self.live
             && live.entries.contains_key(GENERATION_ID)
         {
+            live.finish(GENERATION_CONTENT_ID);
             live.finish(GENERATION_ID);
             live.restore_for_commit();
         }
     }
 
+    fn generation_active(&self) -> bool {
+        self.live
+            .as_ref()
+            .is_some_and(|live| live.entries.contains_key(GENERATION_ID))
+    }
+
+    fn update_generation_message(&mut self, message: &str) {
+        if let Some(live) = &mut self.live
+            && let Some(progress) = live.entries.get(GENERATION_ID)
+        {
+            progress.set_message(message.to_owned());
+            progress.tick();
+        }
+    }
+
     fn reasoning_delta(&mut self, delta: &str) -> io::Result<()> {
         self.reasoning_buffer.push_str(delta);
+        if self.generation_active() {
+            self.announce_generation_reasoning()?;
+            self.update_generation_message("thinking");
+            if self.reasoning_visible {
+                self.reasoning_pending.push_str(delta);
+                let complete = take_complete_lines(&mut self.reasoning_pending);
+                let pending = self.reasoning_pending.clone();
+                self.set_generation_partial("  ", &pending, Color::DarkGrey, Color::DarkGrey);
+                if !complete.is_empty() {
+                    self.commit_generation_text("  ", &complete, Color::DarkGrey, Color::DarkGrey)?;
+                }
+            }
+            return Ok(());
+        }
         if !self.reasoning_announced {
             self.finish_open_lines()?;
             write_styled(
@@ -354,6 +397,18 @@ impl State {
     }
 
     fn assistant_delta(&mut self, delta: &str) -> io::Result<()> {
+        if self.generation_active() {
+            self.flush_generation_reasoning()?;
+            self.update_generation_message("generating");
+            self.assistant_buffer.push_str(delta);
+            let complete = take_complete_lines(&mut self.assistant_buffer);
+            let pending = self.assistant_buffer.clone();
+            self.set_generation_partial("│ ", &pending, Color::Green, Color::White);
+            if !complete.is_empty() {
+                self.commit_generation_text("│ ", &complete, Color::Green, Color::White)?;
+            }
+            return Ok(());
+        }
         if !self.reasoning_at_line_start {
             writeln!(self.writer)?;
             self.reasoning_at_line_start = true;
@@ -367,6 +422,119 @@ impl State {
             Color::White,
             &mut self.assistant_at_line_start,
         )
+    }
+
+    fn announce_generation_reasoning(&mut self) -> io::Result<()> {
+        if self.reasoning_announced {
+            return Ok(());
+        }
+        self.reasoning_announced = true;
+        let active = self.generation_active();
+        if active && let Some(live) = &mut self.live {
+            live.restore_for_commit();
+        }
+        write_styled(
+            &mut self.writer,
+            self.color,
+            if self.reasoning_visible {
+                "▾ Reasoning\n"
+            } else {
+                "▸ Reasoning\n"
+            },
+            Color::DarkGrey,
+            true,
+        )?;
+        if active && let Some(live) = &mut self.live {
+            live.resume_after_commit();
+        }
+        Ok(())
+    }
+
+    fn set_generation_partial(
+        &mut self,
+        prefix: &str,
+        pending: &str,
+        prefix_color: Color,
+        content_color: Color,
+    ) {
+        let Some(live) = &mut self.live else {
+            return;
+        };
+        if pending.is_empty() {
+            live.set_generation_content(None);
+            return;
+        }
+        let content = clean_terminal_line(pending);
+        let available = live
+            .terminal_width
+            .saturating_sub(UnicodeWidthStr::width(prefix));
+        let content = truncate_display_width(&content, available);
+        let message = if self.color {
+            format!(
+                "{}{}",
+                prefix.with(prefix_color),
+                content.with(content_color)
+            )
+        } else {
+            format!("{prefix}{content}")
+        };
+        live.set_generation_content(Some(message));
+    }
+
+    fn commit_generation_text(
+        &mut self,
+        prefix: &str,
+        text: &str,
+        prefix_color: Color,
+        content_color: Color,
+    ) -> io::Result<()> {
+        let active = self.generation_active();
+        if active && let Some(live) = &mut self.live {
+            live.restore_for_commit();
+        }
+        let mut at_line_start = true;
+        append_stream(
+            &mut self.writer,
+            self.color,
+            prefix,
+            text,
+            prefix_color,
+            content_color,
+            &mut at_line_start,
+        )?;
+        if !at_line_start {
+            writeln!(self.writer)?;
+        }
+        if active && let Some(live) = &mut self.live {
+            live.resume_after_commit();
+        }
+        Ok(())
+    }
+
+    fn flush_generation_reasoning(&mut self) -> io::Result<()> {
+        let pending = std::mem::take(&mut self.reasoning_pending);
+        if pending.is_empty() {
+            return Ok(());
+        }
+        if let Some(live) = &mut self.live {
+            live.set_generation_content(None);
+        }
+        self.commit_generation_text("  ", &pending, Color::DarkGrey, Color::DarkGrey)
+    }
+
+    fn flush_generation_pending(&mut self) -> io::Result<()> {
+        if !self.generation_active() {
+            return Ok(());
+        }
+        self.flush_generation_reasoning()?;
+        let pending = std::mem::take(&mut self.assistant_buffer);
+        if pending.is_empty() {
+            return Ok(());
+        }
+        if let Some(live) = &mut self.live {
+            live.set_generation_content(None);
+        }
+        self.commit_generation_text("│ ", &pending, Color::Green, Color::White)
     }
 
     fn finish_open_lines(&mut self) -> io::Result<()> {
@@ -388,7 +556,8 @@ impl State {
         };
         if let Some(live) = &mut self.live {
             live.reserve(self.tools.len());
-            let message = live_tool_message(tool, live.visible_lines, live.terminal_width);
+            let message =
+                live_tool_message(tool, live.visible_lines, live.terminal_width, self.color);
             live.start(id, message);
         }
     }
@@ -398,7 +567,8 @@ impl State {
             return;
         };
         if let Some(live) = &mut self.live {
-            let message = live_tool_message(tool, live.visible_lines, live.terminal_width);
+            let message =
+                live_tool_message(tool, live.visible_lines, live.terminal_width, self.color);
             live.update(id, message);
         }
     }
@@ -425,23 +595,31 @@ impl State {
     fn render_tool_input(
         &mut self,
         id: &str,
-        bash_completion: Option<(&str, Color, &str)>,
+        symbol: &str,
+        color: Color,
+        summary: &str,
     ) -> io::Result<()> {
         let Some(tool) = self.tools.get_mut(id) else {
             return Ok(());
         };
-        if tool.input_rendered {
-            return Ok(());
-        }
-        tool.input_rendered = true;
         let name = tool.name.clone();
         let raw_arguments = tool.arguments.text.clone();
         let truncated = tool.arguments.truncated;
         self.finish_open_lines()?;
         match name.as_str() {
-            "read" => render_read_call(&mut self.writer, self.color, &raw_arguments),
+            "read" => {
+                let detail = read_detail(&raw_arguments);
+                write_tool_completion(
+                    &mut self.writer,
+                    self.color,
+                    symbol,
+                    color,
+                    &name,
+                    &format!("{detail} · {summary}"),
+                )
+            }
             "apply_patch" => {
-                write_tool_header(&mut self.writer, self.color, &name, None)?;
+                write_tool_completion(&mut self.writer, self.color, symbol, color, &name, summary)?;
                 render_patch_operations(
                     &mut self.writer,
                     self.color,
@@ -451,18 +629,7 @@ impl State {
                 )
             }
             "bash" => {
-                if let Some((symbol, color, summary)) = bash_completion {
-                    write_tool_completion(
-                        &mut self.writer,
-                        self.color,
-                        symbol,
-                        color,
-                        &name,
-                        summary,
-                    )?;
-                } else {
-                    write_tool_header(&mut self.writer, self.color, &name, None)?;
-                }
+                write_tool_completion(&mut self.writer, self.color, symbol, color, &name, summary)?;
                 let input = limited_text(
                     &format_tool_input(&name, &raw_arguments),
                     self.limits.tool_input_max_bytes,
@@ -498,8 +665,7 @@ impl State {
         let symbol = if failed { "×" } else { "✓" };
         let color = if failed { Color::Red } else { Color::Green };
         let summary = tool_summary(&name, result, exit_code);
-        let bash_completion = (name == "bash").then_some((symbol, color, summary.as_str()));
-        self.render_tool_input(id, bash_completion)?;
+        self.render_tool_input(id, symbol, color, &summary)?;
         let output = match self.tools.get(id) {
             Some(tool) => {
                 if tool.output.total_bytes > 0 {
@@ -543,7 +709,7 @@ impl State {
                 output.truncated,
             )?,
         }
-        if name != "bash" {
+        if !matches!(name.as_str(), "bash" | "read" | "apply_patch") {
             write_tool_completion(&mut self.writer, self.color, symbol, color, &name, &summary)?;
         }
         self.tools.remove(id);
@@ -557,7 +723,6 @@ impl ToolDisplay {
             name,
             arguments: BoundedInput::new(input_max_bytes.max(64 * 1024)),
             output: TailBuffer::new(output_max_bytes),
-            input_rendered: false,
         }
     }
 }
@@ -567,11 +732,13 @@ impl LiveTools {
         let terminal_width = crossterm::terminal::size()
             .map(|(width, _)| usize::from(width))
             .unwrap_or(80);
-        Self::with_draw_target(
+        let mut live = Self::with_draw_target(
             ProgressDrawTarget::stdout_with_hz(20),
             max_lines,
             terminal_width,
-        )
+        );
+        live.reserve_stdout_rows = true;
+        live
     }
 
     fn with_draw_target(
@@ -586,6 +753,7 @@ impl LiveTools {
             visible_lines: max_lines,
             terminal_width: terminal_width.max(1),
             reserved: false,
+            reserve_stdout_rows: false,
         }
     }
 
@@ -612,7 +780,7 @@ impl LiveTools {
         if self.reserved {
             return;
         }
-        if height > 0 {
+        if self.reserve_stdout_rows && height > 0 {
             let mut stdout = io::stdout();
             for _ in 0..height {
                 let _ = writeln!(stdout);
@@ -648,6 +816,38 @@ impl LiveTools {
         }
     }
 
+    fn set_generation_content(&mut self, message: Option<String>) {
+        match message {
+            Some(message) => {
+                if self.entries.contains_key(GENERATION_CONTENT_ID) {
+                    self.update(GENERATION_CONTENT_ID, message);
+                    return;
+                }
+                self.restore_for_commit();
+                let progress = ProgressBar::new_spinner();
+                progress.set_style(
+                    ProgressStyle::with_template("{msg}")
+                        .expect("static progress template is valid"),
+                );
+                progress.set_message(message);
+                let progress = if let Some(spinner) = self.entries.get(GENERATION_ID) {
+                    self.multi.insert_before(spinner, progress)
+                } else {
+                    self.multi.add(progress)
+                };
+                self.entries
+                    .insert(GENERATION_CONTENT_ID.to_owned(), progress);
+                self.resume_after_commit();
+            }
+            None if self.entries.contains_key(GENERATION_CONTENT_ID) => {
+                self.finish(GENERATION_CONTENT_ID);
+                self.restore_for_commit();
+                self.resume_after_commit();
+            }
+            None => {}
+        }
+    }
+
     fn finish(&mut self, id: &str) {
         if let Some(progress) = self.entries.remove(id) {
             progress.disable_steady_tick();
@@ -658,9 +858,11 @@ impl LiveTools {
     fn restore_for_commit(&mut self) {
         let _ = self.multi.clear();
         if self.reserved {
-            let mut stdout = io::stdout();
-            let _ = execute!(stdout, RestorePosition, Clear(ClearType::FromCursorDown));
-            let _ = stdout.flush();
+            if self.reserve_stdout_rows {
+                let mut stdout = io::stdout();
+                let _ = execute!(stdout, RestorePosition, Clear(ClearType::FromCursorDown));
+                let _ = stdout.flush();
+            }
             self.reserved = false;
         }
     }
@@ -669,7 +871,12 @@ impl LiveTools {
         if self.entries.is_empty() {
             return;
         }
-        self.reserve(self.entries.len());
+        if self.entries.contains_key(GENERATION_ID) {
+            let rows = 1 + usize::from(self.entries.contains_key(GENERATION_CONTENT_ID));
+            self.reserve_rows(rows as u16);
+        } else {
+            self.reserve(self.entries.len());
+        }
         for progress in self.entries.values() {
             progress.force_draw();
         }
@@ -774,7 +981,13 @@ fn format_tool_input(name: &str, raw: &str) -> String {
     }
 }
 
-fn live_tool_message(tool: &ToolDisplay, max_lines: usize, terminal_width: usize) -> String {
+fn live_tool_message(
+    tool: &ToolDisplay,
+    max_lines: usize,
+    terminal_width: usize,
+    color_enabled: bool,
+) -> String {
+    let is_bash = tool.name == "bash";
     let label = match tool.name.as_str() {
         "bash" => {
             let command = format_tool_input("bash", &tool.arguments.text);
@@ -796,7 +1009,10 @@ fn live_tool_message(tool: &ToolDisplay, max_lines: usize, terminal_width: usize
         name => name.to_owned(),
     };
     let label = clean_terminal_line(&label);
-    let label = truncate_display_width(&label, terminal_width.saturating_sub(2));
+    let mut label = truncate_display_width(&label, terminal_width.saturating_sub(2));
+    if is_bash && color_enabled {
+        label = label.replacen('$', "\x1b[1;36m$\x1b[0m", 1);
+    }
     let output = tool.output.limited(max_lines);
     if max_lines == 0 {
         return label;
@@ -912,15 +1128,6 @@ fn write_tool_completion(
         color,
         true,
     )
-}
-
-fn render_read_call(
-    writer: &mut dyn Write,
-    color_enabled: bool,
-    raw_arguments: &str,
-) -> io::Result<()> {
-    let detail = read_detail(raw_arguments);
-    write_tool_header(writer, color_enabled, "read", Some(&detail))
 }
 
 fn read_detail(raw_arguments: &str) -> String {
@@ -1201,7 +1408,17 @@ fn tool_summary(name: &str, result: &ToolResult, exit_code: Option<i32>) -> Stri
         return "failed".into();
     }
     match name {
-        "read" => format!("{} lines", result.output.lines().count()),
+        "read" => {
+            let lines = result
+                .output
+                .lines()
+                .filter(|line| {
+                    line.split_once(": ")
+                        .is_some_and(|(number, _)| number.parse::<usize>().is_ok())
+                })
+                .count();
+            format!("{lines} line{}", if lines == 1 { "" } else { "s" })
+        }
         "apply_patch" => patch_result_summary(&result.output),
         _ => "done".into(),
     }
@@ -1256,6 +1473,13 @@ fn append_stream(
     Ok(())
 }
 
+fn take_complete_lines(pending: &mut String) -> String {
+    let Some(last_newline) = pending.rfind('\n') else {
+        return String::new();
+    };
+    pending.drain(..=last_newline).collect()
+}
+
 fn write_prefixed_block(
     writer: &mut dyn Write,
     color_enabled: bool,
@@ -1299,7 +1523,7 @@ mod tests {
     use indicatif::{InMemoryTerm, ProgressDrawTarget};
     use unicode_width::UnicodeWidthStr;
 
-    use super::{LiveTools, ToolDisplay, live_tool_message};
+    use super::{GENERATION_ID, LiveTools, ToolDisplay, live_tool_message};
 
     #[test]
     fn live_parallel_tools_keep_only_the_latest_output_lines() {
@@ -1314,11 +1538,11 @@ mod tests {
                 .collect::<String>()
                 .as_bytes(),
         );
-        live.start("bash", live_tool_message(&bash, 2, 100));
+        live.start("bash", live_tool_message(&bash, 2, 100, false));
 
         let mut read = ToolDisplay::new("read".into(), 1024, 4096);
         read.arguments.push(r#"{"path":"src/lib.rs"}"#);
-        live.start("read", live_tool_message(&read, 2, 100));
+        live.start("read", live_tool_message(&read, 2, 100, false));
         let contents = terminal.contents();
         assert!(contents.contains("bash  $ cargo test"), "{contents}");
         assert!(contents.contains("read  src/lib.rs"), "{contents}");
@@ -1327,7 +1551,7 @@ mod tests {
         assert!(!contents.contains("line 0"), "{contents}");
 
         live.finish("bash");
-        live.update("read", live_tool_message(&read, 2, 100));
+        live.update("read", live_tool_message(&read, 2, 100, false));
         let contents = terminal.contents();
         assert!(!contents.contains("bash  $ cargo test"), "{contents}");
         assert!(contents.contains("read  src/lib.rs"), "{contents}");
@@ -1341,7 +1565,10 @@ mod tests {
         for index in 0..3 {
             let mut bash = ToolDisplay::new("bash".into(), 1024, 4096);
             bash.arguments.push(r#"{"command":"sleep 20"}"#);
-            live.start(&format!("bash-{index}"), live_tool_message(&bash, 6, 100));
+            live.start(
+                &format!("bash-{index}"),
+                live_tool_message(&bash, 6, 100, false),
+            );
         }
 
         let contents = terminal.contents();
@@ -1363,7 +1590,7 @@ mod tests {
         bash.output
             .push(b"old\n\x1b[31ma very long output line that must be shortened safely\x1b[0m\nlatest\rvalue\n");
 
-        let message = live_tool_message(&bash, 2, 40);
+        let message = live_tool_message(&bash, 2, 40, false);
         let lines = message.lines().collect::<Vec<_>>();
         assert_eq!(lines.len(), 3, "{message:?}");
         assert!(UnicodeWidthStr::width(lines[0]) <= 38, "{message:?}");
@@ -1375,5 +1602,29 @@ mod tests {
         );
         assert!(!message.contains('\x1b'), "{message:?}");
         assert!(!message.contains('\r'), "{message:?}");
+    }
+
+    #[test]
+    fn live_bash_dollar_uses_the_completed_command_color() {
+        let mut bash = ToolDisplay::new("bash".into(), 1024, 4096);
+        bash.arguments.push(r#"{"command":"cargo test"}"#);
+        let message = live_tool_message(&bash, 2, 100, true);
+        let dollar = message.find('$').unwrap();
+        assert!(message[..dollar].contains("\x1b[1;36m"), "{message:?}");
+    }
+
+    #[test]
+    fn generation_content_is_visible_above_the_spinner_before_done() {
+        let terminal = InMemoryTerm::new(8, 100);
+        let target = ProgressDrawTarget::term_like(Box::new(terminal.clone()));
+        let mut live = LiveTools::with_draw_target(target, 2, 100);
+        live.reserve_generation();
+        live.start(GENERATION_ID, "generating".into());
+        live.set_generation_content(Some("│ streamed before done".into()));
+
+        let contents = terminal.contents();
+        let text = contents.find("│ streamed before done").unwrap();
+        let spinner = contents.find("generating").unwrap();
+        assert!(text < spinner, "{contents:?}");
     }
 }

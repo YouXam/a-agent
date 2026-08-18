@@ -64,10 +64,35 @@ impl ToolResult {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Usage {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub cached_tokens: Option<u64>,
+    pub cache_write_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+}
+
+impl Usage {
+    pub fn context_tokens(self) -> Option<u64> {
+        if let Some(total) = self.total_tokens.filter(|total| *total > 0) {
+            return Some(total);
+        }
+        [
+            self.input_tokens,
+            self.output_tokens,
+            self.cached_tokens,
+            self.cache_write_tokens,
+        ]
+        .iter()
+        .any(Option::is_some)
+        .then(|| {
+            self.input_tokens.unwrap_or(0)
+                + self.output_tokens.unwrap_or(0)
+                + self.cached_tokens.unwrap_or(0)
+                + self.cache_write_tokens.unwrap_or(0)
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -80,6 +105,7 @@ pub struct ModelMessage {
 pub struct ModelRequest {
     pub system_prompt: String,
     pub messages: Vec<ModelMessage>,
+    pub include_tools: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -146,5 +172,6 @@ pub struct ConversationItem {
     pub parent_id: Option<String>,
     pub role: Role,
     pub blocks: Vec<ContentBlock>,
+    pub usage: Option<Usage>,
     pub created_at: i64,
 }

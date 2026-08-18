@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::io::Write;
@@ -77,7 +77,7 @@ impl ProviderConfig {
         }
         get_env(&self.api_key_env).ok_or_else(|| {
             anyhow::anyhow!(
-                "provider authentication is not configured; set provider.api_key, set {}, or update ~/.config/a/config.toml",
+                "provider authentication is not configured; set api_key in the selected provider, set {}, or update ~/.config/a/config.toml",
                 self.api_key_env
             )
         })
@@ -98,6 +98,29 @@ impl fmt::Debug for ProviderConfig {
             .field("request", &self.request)
             .finish()
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ModelProfile {
+    pub provider: String,
+    pub model: String,
+    pub effort: Option<String>,
+    pub efforts: Vec<String>,
+    pub context_window: Option<u64>,
+    pub max_tokens: Option<u32>,
+    pub headers: BTreeMap<String, String>,
+    pub request: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelSelection {
+    pub name: String,
+    pub provider_name: String,
+    pub provider: ProviderConfig,
+    pub effort: Option<String>,
+    pub efforts: Vec<String>,
+    pub context_window: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -165,6 +188,7 @@ impl Default for ContextConfig {
 pub struct SessionConfig {
     pub max_agent_cycles: usize,
     pub shell_history_limit: usize,
+    pub input_history_limit: usize,
 }
 
 impl Default for SessionConfig {
@@ -172,18 +196,43 @@ impl Default for SessionConfig {
         Self {
             max_agent_cycles: 50,
             shell_history_limit: 5000,
+            input_history_limit: 1000,
         }
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    pub provider: ProviderConfig,
+    pub default_model: String,
+    pub providers: BTreeMap<String, ProviderConfig>,
+    pub models: BTreeMap<String, ModelProfile>,
     pub ui: UiConfig,
     pub tools: ToolsConfig,
     pub context: ContextConfig,
     pub session: SessionConfig,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        let default_model = ModelProfile {
+            provider: "openai".into(),
+            model: "gpt-5.6".into(),
+            effort: Some("medium".into()),
+            efforts: canonical_efforts(),
+            context_window: Some(1_050_000),
+            ..ModelProfile::default()
+        };
+        Self {
+            default_model: "default".into(),
+            providers: BTreeMap::from([("openai".into(), ProviderConfig::default())]),
+            models: BTreeMap::from([("default".into(), default_model)]),
+            ui: UiConfig::default(),
+            tools: ToolsConfig::default(),
+            context: ContextConfig::default(),
+            session: SessionConfig::default(),
+        }
+    }
 }
 
 impl Config {
@@ -220,17 +269,28 @@ impl Config {
             }
         }
 
-        let api_key_explicit = merged
-            .get("provider")
-            .and_then(|value| value.get("api_key_env"))
-            .is_some();
+        if merged.get("provider").is_some() {
+            anyhow::bail!(
+                "legacy [provider] configuration is no longer supported; define [providers.<name>], [models.<name>], and default_model"
+            );
+        }
+        let explicit_api_key_envs = merged
+            .get("providers")
+            .and_then(toml::Value::as_table)
+            .into_iter()
+            .flat_map(|providers| providers.iter())
+            .filter_map(|(name, value)| value.get("api_key_env").map(|_| name.clone()))
+            .collect::<BTreeSet<_>>();
         let mut config: Self = merged.try_into().context("decode merged configuration")?;
-        if !api_key_explicit && config.provider.kind == ProviderKind::Anthropic {
-            config.provider.api_key_env = "ANTHROPIC_API_KEY".into();
+        for (name, provider) in &mut config.providers {
+            if !explicit_api_key_envs.contains(name) && provider.kind == ProviderKind::Anthropic {
+                provider.api_key_env = "ANTHROPIC_API_KEY".into();
+            }
         }
         if config.tools.max_parallel == 0 {
             anyhow::bail!("tools.max_parallel must be greater than zero");
         }
+        config.validate_models()?;
         Ok(config)
     }
 
@@ -240,6 +300,171 @@ impl Config {
             .context("HOME is not set")?;
         Self::load_from(cwd, &home)
     }
+
+    pub fn model_names(&self) -> Vec<&str> {
+        self.models.keys().map(String::as_str).collect()
+    }
+
+    pub fn resolve_model(
+        &self,
+        name: Option<&str>,
+        effort_override: Option<&str>,
+    ) -> Result<ModelSelection> {
+        let name = name.unwrap_or(&self.default_model);
+        let profile = self
+            .models
+            .get(name)
+            .with_context(|| format!("model profile not found: {name}"))?;
+        let mut provider = self
+            .providers
+            .get(&profile.provider)
+            .cloned()
+            .with_context(|| {
+                format!(
+                    "provider '{}' referenced by model '{name}' was not found",
+                    profile.provider
+                )
+            })?;
+        provider.model = profile.model.clone();
+        if let Some(max_tokens) = profile.max_tokens {
+            provider.max_tokens = max_tokens;
+        }
+        provider.headers.extend(profile.headers.clone());
+        provider.request.extend(profile.request.clone());
+
+        let effort = effort_override.or(profile.effort.as_deref());
+        if let Some(effort) = effort {
+            validate_effort(effort)?;
+            if !profile.efforts.iter().any(|candidate| candidate == effort) {
+                anyhow::bail!("effort '{effort}' is not configured for model '{name}'");
+            }
+            apply_effort(&mut provider, effort)?;
+        }
+        Ok(ModelSelection {
+            name: name.into(),
+            provider_name: profile.provider.clone(),
+            provider,
+            effort: effort.map(str::to_owned),
+            efforts: profile.efforts.clone(),
+            context_window: profile.context_window,
+        })
+    }
+
+    pub fn resolve_session_model(
+        &self,
+        profile: Option<&str>,
+        provider_type: &str,
+        model: &str,
+        effort: Option<&str>,
+    ) -> Result<ModelSelection> {
+        if let Some(profile) = profile {
+            return self.resolve_model(Some(profile), effort);
+        }
+        let kind = ProviderKind::parse(provider_type)?;
+        for name in self.models.keys() {
+            let selection = self.resolve_model(Some(name), None)?;
+            if selection.provider.kind == kind && selection.provider.model == model {
+                return self.resolve_model(Some(name), effort);
+            }
+        }
+        anyhow::bail!(
+            "session model {provider_type}/{model} does not match a configured model profile"
+        )
+    }
+
+    fn validate_models(&self) -> Result<()> {
+        if self.models.is_empty() {
+            anyhow::bail!("at least one [models.<name>] profile is required");
+        }
+        if !self.models.contains_key(&self.default_model) {
+            anyhow::bail!("default_model '{}' was not found", self.default_model);
+        }
+        for (name, profile) in &self.models {
+            if profile.provider.is_empty() || profile.model.is_empty() {
+                anyhow::bail!("model '{name}' requires provider and model");
+            }
+            let provider = self.providers.get(&profile.provider).with_context(|| {
+                format!(
+                    "provider '{}' referenced by model '{name}' was not found",
+                    profile.provider
+                )
+            })?;
+            let max_tokens = profile.max_tokens.unwrap_or(provider.max_tokens);
+            if max_tokens == 0 {
+                anyhow::bail!("max_tokens must be greater than zero for model '{name}'");
+            }
+            if let Some(context_window) = profile.context_window
+                && context_window <= u64::from(max_tokens)
+            {
+                anyhow::bail!(
+                    "context_window ({context_window}) must be greater than max_tokens ({max_tokens}) for model '{name}'"
+                );
+            }
+            for effort in profile.efforts.iter().chain(profile.effort.iter()) {
+                validate_effort(effort)?;
+            }
+            if let Some(effort) = &profile.effort
+                && !profile.efforts.iter().any(|candidate| candidate == effort)
+            {
+                anyhow::bail!(
+                    "default effort '{effort}' is not listed in efforts for model '{name}'"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+fn canonical_efforts() -> Vec<String> {
+    ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+}
+
+fn validate_effort(effort: &str) -> Result<()> {
+    if canonical_efforts()
+        .iter()
+        .any(|candidate| candidate == effort)
+    {
+        Ok(())
+    } else {
+        anyhow::bail!("unknown effort '{effort}'")
+    }
+}
+
+fn apply_effort(provider: &mut ProviderConfig, effort: &str) -> Result<()> {
+    match provider.kind {
+        ProviderKind::Responses => {
+            insert_nested_request_value(&mut provider.request, "reasoning", "effort", effort)
+        }
+        ProviderKind::Chatcompletion => {
+            provider.request.insert(
+                "reasoning_effort".into(),
+                serde_json::Value::String(effort.into()),
+            );
+            Ok(())
+        }
+        ProviderKind::Anthropic => {
+            insert_nested_request_value(&mut provider.request, "output_config", "effort", effort)
+        }
+    }
+}
+
+fn insert_nested_request_value(
+    request: &mut BTreeMap<String, serde_json::Value>,
+    object_key: &str,
+    field: &str,
+    value: &str,
+) -> Result<()> {
+    let object = request
+        .entry(object_key.into())
+        .or_insert_with(|| serde_json::json!({}));
+    let object = object
+        .as_object_mut()
+        .with_context(|| format!("request.{object_key} must be an object"))?;
+    object.insert(field.into(), serde_json::Value::String(value.into()));
+    Ok(())
 }
 
 fn merge_toml(base: &mut toml::Value, overlay: toml::Value) {

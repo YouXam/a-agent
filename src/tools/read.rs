@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use super::path::workspace_path;
+use super::path::unrestricted_path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReadArgs {
@@ -23,7 +23,7 @@ pub async fn read_text_file_bounded(
     max_lines: usize,
     max_bytes: usize,
 ) -> Result<String> {
-    let path = workspace_path(root, &args.path, true)?;
+    let path = unrestricted_path(root, &args.path, true)?;
     let bytes = tokio::fs::read(&path)
         .await
         .with_context(|| format!("read {}", path.display()))?;
