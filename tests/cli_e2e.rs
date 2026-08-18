@@ -648,7 +648,12 @@ async fn wait_for_fish_prompt(socket: &str, session: &str) {
             .lines()
             .rev()
             .find(|line| !line.trim().is_empty())
-            .is_some_and(|line| line.trim_end().ends_with('#'))
+            .is_some_and(|line| {
+                let line = line.trim_end();
+                ['#', '>', '$', '❯']
+                    .iter()
+                    .any(|suffix| line.ends_with(*suffix))
+            })
         {
             return;
         }
