@@ -533,8 +533,18 @@ api_key = "secret"
     assert_eq!(pane.matches("fix previous failure").count(), 1, "{pane:?}");
     assert!(!pane.contains("a --fish-ai"), "{pane:?}");
     let body = String::from_utf8(requests[0].body.clone()).unwrap();
-    assert!(body.contains("Recent shell commands recorded"), "{body}");
-    assert!(body.contains("`false` -> exit 1"), "{body}");
+    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let instructions = body["instructions"].as_str().unwrap();
+    assert!(
+        instructions.contains("Runtime shell context"),
+        "{instructions}"
+    );
+    assert!(
+        instructions.contains("command: \"false\""),
+        "{instructions}"
+    );
+    assert!(instructions.contains("exit_code: 1"), "{instructions}");
+    assert_eq!(body["input"][0]["content"], "fix previous failure");
 }
 
 #[cfg(unix)]

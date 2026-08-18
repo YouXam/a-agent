@@ -170,6 +170,9 @@ dedicated `[AI]` input prompt. It deliberately does not enable Fish `--shell`
 mode, so shell syntax highlighting, autosuggestions, and tab completion do not
 apply. Enter invokes the agent without echoing an internal command line, then
 returns to the Fish prompt.
+Press `Ctrl+G` again to restore the current text to the normal Fish editor on
+the same line. Press `Ctrl+C` to cancel the AI input line and open a fresh Fish
+prompt.
 
 Each Fish process has an isolated conversation for each cwd. Opening another
 Fish process in the same directory starts a separate conversation. Use
@@ -177,8 +180,9 @@ Fish process in the same directory starts a separate conversation. Use
 of which Fish process created it.
 
 The Fish hooks record command, cwd, exit status, pipe status, start time, and
-duration. They never capture stdout or stderr. Agent requests from `Ctrl+G`
-receive recent command records from that Fish process and cwd only.
+duration. They never capture stdout or stderr. The Rust runtime injects recent
+command records from that Fish process and cwd into the request's system
+context.
 
 ## Security
 

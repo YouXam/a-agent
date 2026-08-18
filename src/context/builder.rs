@@ -29,7 +29,7 @@ pub fn build_system_prompt(input: &ContextInput) -> String {
         input.cwd.display()
     );
     prompt.push_str(
-        "When a user message includes recent shell commands recorded by the Fish integration, those commands are directly available context. Do not claim that you cannot see commands listed there.\n",
+        "The Fish script records command metadata in SQLite. The Rust runtime injects recent records from the current Fish session and cwd into each request under `Runtime shell context`. Commands listed there are directly visible to you. Do not claim that the integration lacks context injection or that you cannot see listed commands. Bash tool calls in the conversation are also visible to you.\n",
     );
 
     if !input.agents.is_empty() {

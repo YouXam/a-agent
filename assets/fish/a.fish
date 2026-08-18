@@ -1,4 +1,5 @@
 # a-agent Fish integration. Records command metadata only; no output is captured.
+# The Rust runtime injects recent records from this Fish session into agent requests.
 
 if not set -q __a_fish_session_key
     set -g __a_fish_session_key (string join '' a_fish_ $fish_pid _ (date +%s) _ (random) _ (random))
@@ -36,12 +37,42 @@ function __a_render_ai_prompt
 end
 
 function __a_ai_prompt
+    if set -q __a_ai_prompt_active
+        set -g __a_ai_toggle_text (commandline)
+        set -g __a_ai_toggle_requested 1
+        commandline -f execute
+        return
+    end
+
     set -l initial (commandline)
+    set -l shell_prompt_rows (count (fish_prompt))
     commandline -r ''
     commandline -f repaint
 
+    set -g __a_ai_prompt_active 1
     set -l prompt
-    if read --local --line --command "$initial" --prompt __a_render_ai_prompt prompt
+    read --local --line --command "$initial" --prompt __a_render_ai_prompt prompt
+    set -l read_status $status
+    set -e __a_ai_prompt_active
+
+    if set -q __a_ai_toggle_requested
+        set -l shell_text "$__a_ai_toggle_text"
+        set -e __a_ai_toggle_requested
+        set -e __a_ai_toggle_text
+        set -l columns (tput cols 2>/dev/null)
+        if not string match --quiet --regex '^[1-9][0-9]*$' -- "$columns"
+            set columns 80
+        end
+        set -l text_width (string length --visible -- "$shell_text")
+        set -l ai_rows (math "max(1, ceil((5 + $text_width) / $columns))")
+        set -l clear_rows (math "max(1, $shell_prompt_rows + $ai_rows - 1)")
+        printf '\e[%dA\r\e[J' $clear_rows
+        commandline -r "$shell_text"
+        commandline -f repaint
+        return
+    end
+
+    if test $read_status -eq 0
         if test -n (string trim -- "$prompt")
             set -lx A_FISH_AI_PROMPT "$prompt"
             command a --fish-ai --fish-session-key "$__a_fish_session_key" --one-turn

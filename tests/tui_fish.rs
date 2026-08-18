@@ -219,6 +219,7 @@ fn fish_script_has_metadata_hooks_dedicated_ai_read_and_mode_bindings() {
     assert!(script.contains("A_FISH_AI_PROMPT"));
     assert!(script.contains("[AI] "));
     assert!(script.contains("read --local --line"));
+    assert!(script.contains("__a_ai_prompt_active"));
     assert!(!script.contains("--shell"));
     assert!(script.contains("bind -M default \\cg __a_ai_prompt"));
     assert!(script.contains("bind -M insert \\cg __a_ai_prompt"));
@@ -305,8 +306,23 @@ async fn new_fish_has_immediate_ai_prompt_without_shell_completion_and_invokes_a
         !input.contains("\x1b["),
         "AI input was syntax-highlighted: {ai_line:?}"
     );
+    tmux_key(&socket, session, "C-g").await;
+    let normal_mode = wait_for_last_line(&socket, session, |line| line.contains("[1]#")).await;
+    assert!(
+        last_visible_line(&normal_mode).contains("git che"),
+        "{normal_mode:?}"
+    );
+    assert!(!normal_mode.contains("[AI] git che"), "{normal_mode:?}");
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     tmux_key(&socket, session, "C-c").await;
     wait_for_prompt(&socket, session).await;
+    tmux_key(&socket, session, "C-g").await;
+    wait_for_pane(&socket, session, "[AI]").await;
+    tmux_type(&socket, session, "cancel me").await;
+    tmux_key(&socket, session, "C-c").await;
+    let interrupted = wait_for_last_line(&socket, session, |line| line.contains("[1]#")).await;
+    assert!(interrupted.contains("[AI] cancel me"), "{interrupted:?}");
 
     tmux_key(&socket, session, "C-g").await;
     wait_for_pane(&socket, session, "[AI]").await;
