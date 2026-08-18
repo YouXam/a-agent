@@ -136,7 +136,8 @@ Default controls:
 
 - `Esc Esc`: rewind picker
 - `Ctrl+O`: toggle reasoning visibility
-- `Ctrl+C`: cancel or exit
+- `Esc` or `Ctrl+C` during a turn: cancel the active turn
+- `Ctrl+C` at the prompt: exit
 - `Up` / `Down`: input or picker history
 
 The reasoning key is configurable with `ui.reasoning_toggle = "ctrl-r"`.

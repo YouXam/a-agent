@@ -9,6 +9,7 @@ use crossterm::style::{Attribute, Color, Stylize};
 use crossterm::terminal::{Clear, ClearType};
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use serde_json::Value;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::model::{StreamEvent, ToolResult};
 use crate::provider::EventSink;
@@ -79,6 +80,8 @@ struct LiveTools {
     multi: MultiProgress,
     entries: HashMap<String, ProgressBar>,
     max_lines: usize,
+    visible_lines: usize,
+    terminal_width: usize,
     reserved: bool,
 }
 
@@ -358,14 +361,9 @@ impl State {
         let Some(tool) = self.tools.get(id) else {
             return;
         };
-        let max_lines = self
-            .live
-            .as_ref()
-            .map(|live| live.max_lines)
-            .unwrap_or(self.limits.tool_live_output_lines);
-        let message = live_tool_message(tool, max_lines);
         if let Some(live) = &mut self.live {
             live.reserve(self.tools.len());
+            let message = live_tool_message(tool, live.visible_lines, live.terminal_width);
             live.start(id, message);
         }
     }
@@ -374,13 +372,8 @@ impl State {
         let Some(tool) = self.tools.get(id) else {
             return;
         };
-        let max_lines = self
-            .live
-            .as_ref()
-            .map(|live| live.max_lines)
-            .unwrap_or(self.limits.tool_live_output_lines);
-        let message = live_tool_message(tool, max_lines);
         if let Some(live) = &mut self.live {
+            let message = live_tool_message(tool, live.visible_lines, live.terminal_width);
             live.update(id, message);
         }
     }
@@ -493,7 +486,10 @@ impl State {
             )?,
         }
         let exit_code = parse_exit_code(&result.output);
-        let failed = result.is_error || exit_code.is_some_and(|code| code != 0);
+        let bash_interrupted = name == "bash"
+            && (result.output.contains("[bash cancelled]")
+                || result.output.contains("[bash timed out after "));
+        let failed = result.is_error || bash_interrupted || exit_code.is_some_and(|code| code != 0);
         let symbol = if failed { "×" } else { "✓" };
         let color = if failed { Color::Red } else { Color::Green };
         let summary = tool_summary(&name, result, exit_code);
@@ -522,14 +518,27 @@ impl ToolDisplay {
 
 impl LiveTools {
     fn new(max_lines: usize) -> Self {
-        Self::with_draw_target(ProgressDrawTarget::stdout_with_hz(20), max_lines)
+        let terminal_width = crossterm::terminal::size()
+            .map(|(width, _)| usize::from(width))
+            .unwrap_or(80);
+        Self::with_draw_target(
+            ProgressDrawTarget::stdout_with_hz(20),
+            max_lines,
+            terminal_width,
+        )
     }
 
-    fn with_draw_target(draw_target: ProgressDrawTarget, max_lines: usize) -> Self {
+    fn with_draw_target(
+        draw_target: ProgressDrawTarget,
+        max_lines: usize,
+        terminal_width: usize,
+    ) -> Self {
         Self {
             multi: MultiProgress::with_draw_target(draw_target),
             entries: HashMap::new(),
             max_lines,
+            visible_lines: max_lines,
+            terminal_width: terminal_width.max(1),
             reserved: false,
         }
     }
@@ -538,11 +547,14 @@ impl LiveTools {
         if self.reserved {
             return;
         }
-        let terminal_height = crossterm::terminal::size()
-            .map(|(_, height)| height)
-            .unwrap_or(24);
-        let desired = tool_count.saturating_mul(self.max_lines.saturating_add(1));
-        let height = (desired as u16).min(terminal_height.saturating_sub(1));
+        let (terminal_width, terminal_height) =
+            crossterm::terminal::size().unwrap_or((self.terminal_width as u16, 24));
+        self.terminal_width = usize::from(terminal_width).max(1);
+        let available_rows = usize::from(terminal_height.saturating_sub(1));
+        let rows_per_tool = available_rows / tool_count.max(1);
+        self.visible_lines = self.max_lines.min(rows_per_tool.saturating_sub(1));
+        let desired = tool_count.saturating_mul(self.visible_lines.saturating_add(1));
+        let height = desired.min(available_rows) as u16;
         if height > 0 {
             let mut stdout = io::stdout();
             for _ in 0..height {
@@ -560,15 +572,14 @@ impl LiveTools {
             self.update(id, message);
             return;
         }
-        let progress = ProgressBar::new_spinner();
+        let progress = self.multi.add(ProgressBar::new_spinner());
         progress.set_style(
-            ProgressStyle::with_template("{spinner:.yellow} {wide_msg}")
+            ProgressStyle::with_template("{spinner:.yellow} {msg}")
                 .expect("static progress template is valid")
                 .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ "),
         );
         progress.set_message(message);
         progress.enable_steady_tick(Duration::from_millis(80));
-        let progress = self.multi.add(progress);
         progress.force_draw();
         self.entries.insert(id.to_owned(), progress);
     }
@@ -706,11 +717,16 @@ fn format_tool_input(name: &str, raw: &str) -> String {
     }
 }
 
-fn live_tool_message(tool: &ToolDisplay, max_lines: usize) -> String {
+fn live_tool_message(tool: &ToolDisplay, max_lines: usize, terminal_width: usize) -> String {
     let label = match tool.name.as_str() {
         "bash" => {
             let command = format_tool_input("bash", &tool.arguments.text);
-            format!("bash  $ {}", compact_line(&command, 100))
+            let mut lines = command.lines();
+            let first_line = lines.next().unwrap_or_default();
+            format!(
+                "bash  $ {first_line}{}",
+                if lines.next().is_some() { "…" } else { "" }
+            )
         }
         "read" => format!("read  {}", read_detail(&tool.arguments.text)),
         "apply_patch" => {
@@ -722,28 +738,65 @@ fn live_tool_message(tool: &ToolDisplay, max_lines: usize) -> String {
         }
         name => name.to_owned(),
     };
+    let label = clean_terminal_line(&label);
+    let label = truncate_display_width(&label, terminal_width.saturating_sub(2));
     let output = tool.output.limited(max_lines);
-    if output.lines.is_empty() {
+    if max_lines == 0 {
         return label;
     }
     let mut message = label;
-    for line in output.lines {
-        message.push_str("\n  │ ");
+    let output_line_count = output.lines.len();
+    for (index, line) in output.lines.into_iter().enumerate() {
+        let prefix = if output.truncated && index == 0 {
+            "  … "
+        } else {
+            "  │ "
+        };
+        let line = clean_terminal_line(&line);
+        let line = truncate_display_width(&line, terminal_width.saturating_sub(4));
+        message.push('\n');
+        message.push_str(prefix);
         message.push_str(&line);
     }
-    if output.truncated {
-        message.push_str("\n  … showing latest output");
+    for _ in output_line_count..max_lines {
+        message.push_str("\n    ");
     }
     message
 }
 
-fn compact_line(value: &str, max_chars: usize) -> String {
-    let first_line = value.lines().next().unwrap_or_default();
-    let mut compact = first_line.chars().take(max_chars).collect::<String>();
-    if first_line.chars().count() > max_chars || value.lines().count() > 1 {
-        compact.push('…');
+fn clean_terminal_line(value: &str) -> String {
+    String::from_utf8_lossy(&strip_ansi_escapes::strip(value.as_bytes()))
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
+fn truncate_display_width(value: &str, max_width: usize) -> String {
+    if UnicodeWidthStr::width(value) <= max_width {
+        return value.to_owned();
     }
-    compact
+    if max_width == 0 {
+        return String::new();
+    }
+    let content_width = max_width.saturating_sub(1);
+    let mut result = String::new();
+    let mut width = 0;
+    for character in value.chars() {
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if width + character_width > content_width {
+            break;
+        }
+        result.push(character);
+        width += character_width;
+    }
+    result.push('…');
+    result
 }
 
 fn write_tool_header(
@@ -1031,6 +1084,12 @@ fn parse_exit_code(output: &str) -> Option<i32> {
 }
 
 fn tool_summary(name: &str, result: &ToolResult, exit_code: Option<i32>) -> String {
+    if name == "bash" && result.output.contains("[bash cancelled]") {
+        return "cancelled".into();
+    }
+    if name == "bash" && result.output.contains("[bash timed out after ") {
+        return "timed out".into();
+    }
     if let Some(exit_code) = exit_code {
         return format!("exit {exit_code}");
     }
@@ -1134,6 +1193,7 @@ fn write_styled(
 #[cfg(test)]
 mod tests {
     use indicatif::{InMemoryTerm, ProgressDrawTarget};
+    use unicode_width::UnicodeWidthStr;
 
     use super::{LiveTools, ToolDisplay, live_tool_message};
 
@@ -1141,7 +1201,7 @@ mod tests {
     fn live_parallel_tools_keep_only_the_latest_output_lines() {
         let terminal = InMemoryTerm::new(12, 100);
         let target = ProgressDrawTarget::term_like(Box::new(terminal.clone()));
-        let mut live = LiveTools::with_draw_target(target, 2);
+        let mut live = LiveTools::with_draw_target(target, 2, 100);
         let mut bash = ToolDisplay::new("bash".into(), 1024, 4096);
         bash.arguments.push(r#"{"command":"cargo test"}"#);
         bash.output.push(
@@ -1150,11 +1210,11 @@ mod tests {
                 .collect::<String>()
                 .as_bytes(),
         );
-        live.start("bash", live_tool_message(&bash, 2));
+        live.start("bash", live_tool_message(&bash, 2, 100));
 
         let mut read = ToolDisplay::new("read".into(), 1024, 4096);
         read.arguments.push(r#"{"path":"src/lib.rs"}"#);
-        live.start("read", live_tool_message(&read, 2));
+        live.start("read", live_tool_message(&read, 2, 100));
         let contents = terminal.contents();
         assert!(contents.contains("bash  $ cargo test"), "{contents}");
         assert!(contents.contains("read  src/lib.rs"), "{contents}");
@@ -1163,9 +1223,31 @@ mod tests {
         assert!(!contents.contains("line 0"), "{contents}");
 
         live.finish("bash");
-        live.update("read", live_tool_message(&read, 2));
+        live.update("read", live_tool_message(&read, 2, 100));
         let contents = terminal.contents();
         assert!(!contents.contains("bash  $ cargo test"), "{contents}");
         assert!(contents.contains("read  src/lib.rs"), "{contents}");
+    }
+
+    #[test]
+    fn live_tool_lines_fit_the_terminal_and_strip_control_sequences() {
+        let mut bash = ToolDisplay::new("bash".into(), 4096, 4096);
+        bash.arguments
+            .push(r#"{"command":"cd /a/very/long/directory && grep -rn pyright .gitlab-ci.yml"}"#);
+        bash.output
+            .push(b"old\n\x1b[31ma very long output line that must be shortened safely\x1b[0m\nlatest\rvalue\n");
+
+        let message = live_tool_message(&bash, 2, 40);
+        let lines = message.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 3, "{message:?}");
+        assert!(UnicodeWidthStr::width(lines[0]) <= 38, "{message:?}");
+        assert!(
+            lines[1..]
+                .iter()
+                .all(|line| UnicodeWidthStr::width(*line) <= 40),
+            "{message:?}"
+        );
+        assert!(!message.contains('\x1b'), "{message:?}");
+        assert!(!message.contains('\r'), "{message:?}");
     }
 }

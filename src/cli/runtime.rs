@@ -4,6 +4,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use futures_util::StreamExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::Agent;
@@ -147,7 +150,7 @@ pub async fn run() -> Result<i32> {
             renderer.render_user(prompt)?;
         }
         let contextual = contextual_prompt(prompt, stdin_context.as_deref(), &shell_history);
-        if run_turn(&agent, &renderer, &contextual).await? {
+        if run_turn(&agent, &renderer, &contextual).await? && args.one_turn {
             return Ok(130);
         }
         if args.one_turn {
@@ -162,9 +165,7 @@ pub async fn run() -> Result<i32> {
             InputAction::Submit(prompt) if !prompt.trim().is_empty() => {
                 renderer.begin_turn()?;
                 let contextual = contextual_prompt(&prompt, None, &shell_history);
-                if run_turn(&agent, &renderer, &contextual).await? {
-                    return Ok(130);
-                }
+                run_turn(&agent, &renderer, &contextual).await?;
             }
             InputAction::Submit(_) => {}
             InputAction::ToggleReasoning => {
@@ -210,16 +211,95 @@ async fn run_turn(agent: &Agent, renderer: &InlineRenderer, prompt: &str) -> Res
     let cancel = CancellationToken::new();
     let turn = agent.submit(prompt, renderer.event_sink(), cancel.clone());
     tokio::pin!(turn);
-    tokio::select! {
-        result = &mut turn => { result?; Ok(false) }
-        signal = tokio::signal::ctrl_c() => {
-            signal?;
-            cancel.cancel();
-            let _ = turn.await;
-            renderer.render_status("cancelled")?;
-            Ok(true)
+    let raw_mode = RawModeGuard::enable_if_terminal()?;
+    let mut events = raw_mode.as_ref().map(|_| EventStream::new());
+    let interrupted = if let Some(events) = &mut events {
+        tokio::select! {
+            result = &mut turn => { result?; false }
+            signal = tokio::signal::ctrl_c() => {
+                signal?;
+                true
+            }
+            key = wait_for_turn_interrupt(events) => {
+                key?;
+                true
+            }
+        }
+    } else {
+        tokio::select! {
+            result = &mut turn => { result?; false }
+            signal = tokio::signal::ctrl_c() => {
+                signal?;
+                true
+            }
+        }
+    };
+    if !interrupted {
+        return Ok(false);
+    }
+    cancel.cancel();
+    let _ = turn.await;
+    drop(events);
+    drop(raw_mode);
+    renderer.render_status("cancelled")?;
+    Ok(true)
+}
+
+async fn wait_for_turn_interrupt(events: &mut EventStream) -> io::Result<()> {
+    while let Some(event) = events.next().await {
+        if let Event::Key(key) = event?
+            && key.kind != KeyEventKind::Release
+            && (key.code == KeyCode::Esc
+                || (key.code == KeyCode::Char('c')
+                    && key.modifiers.contains(KeyModifiers::CONTROL)))
+        {
+            return Ok(());
         }
     }
+    Err(io::Error::new(
+        io::ErrorKind::UnexpectedEof,
+        "terminal input stream closed during agent turn",
+    ))
+}
+
+struct RawModeGuard;
+
+impl RawModeGuard {
+    fn enable_if_terminal() -> io::Result<Option<Self>> {
+        if !io::stdin().is_terminal() {
+            return Ok(None);
+        }
+        enable_raw_mode()?;
+        #[cfg(unix)]
+        if let Err(error) = enable_terminal_output_processing() {
+            let _ = disable_raw_mode();
+            return Err(error);
+        }
+        Ok(Some(Self))
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+    }
+}
+
+#[cfg(unix)]
+fn enable_terminal_output_processing() -> io::Result<()> {
+    let mut attributes = std::mem::MaybeUninit::<libc::termios>::uninit();
+    // SAFETY: STDIN is a terminal here and attributes points to writable termios storage.
+    if unsafe { libc::tcgetattr(libc::STDIN_FILENO, attributes.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: tcgetattr initialized attributes after returning successfully.
+    let mut attributes = unsafe { attributes.assume_init() };
+    attributes.c_oflag |= libc::OPOST | libc::ONLCR;
+    // SAFETY: attributes was read from the same terminal and remains valid for tcsetattr.
+    if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &attributes) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn resolve_session(

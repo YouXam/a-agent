@@ -548,7 +548,7 @@ tool_output_max_bytes = 4096
             "new-session",
             "-d",
             "-x",
-            "100",
+            "60",
             "-y",
             "24",
             "-s",
@@ -572,6 +572,15 @@ tool_output_max_bytes = 4096
     let live = tmux_pane(&socket, session).await;
     assert!(live.contains("live-4"), "{live:?}");
     assert!(!live.contains("live-1"), "{live:?}");
+    let live_spinner_lines = live
+        .lines()
+        .filter(|line| {
+            ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+                .iter()
+                .any(|spinner| line.starts_with(spinner))
+        })
+        .count();
+    assert_eq!(live_spinner_lines, 1, "duplicate live frames: {live:?}");
 
     let final_pane = wait_for_tmux_text(&socket, session, "stream complete").await;
     let final_history = tmux_history(&socket, session).await;
@@ -588,6 +597,116 @@ tool_output_max_bytes = 4096
             .any(|spinner| final_history.contains(spinner)),
         "transient spinner leaked into scrollback: {final_history:?}"
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn escape_cancels_a_running_bash_tool_and_returns_to_the_shell() {
+    if Command::new("tmux").arg("-V").output().await.is_err() {
+        return;
+    }
+    let server = MockServer::start().await;
+    let command = "echo escape-started; sleep 10; echo escape-finished";
+    let body = format!(
+        "data: {}\n\ndata: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+        serde_json::json!({
+            "type":"response.output_item.added",
+            "item":{"type":"function_call","id":"item_escape","call_id":"call_escape","name":"bash","arguments":serde_json::json!({"command":command}).to_string()}
+        }),
+        serde_json::json!({
+            "type":"response.output_item.done",
+            "item":{"type":"function_call","id":"item_escape","call_id":"call_escape","name":"bash","arguments":serde_json::json!({"command":command}).to_string()}
+        }),
+        serde_json::json!({"type":"response.completed","response":{"usage":{}}}),
+    );
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(body),
+        )
+        .mount(&server)
+        .await;
+
+    let temp = tempdir().unwrap();
+    let home = temp.path().join("home");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(home.join(".config/a")).unwrap();
+    fs::create_dir_all(&repo).unwrap();
+    fs::write(
+        home.join(".config/a/config.toml"),
+        format!(
+            "[provider]\ntype = \"responses\"\nbase_url = \"{}/v1\"\nmodel = \"test-model\"\napi_key = \"secret\"\n",
+            server.uri()
+        ),
+    )
+    .unwrap();
+
+    let socket = format!("a-escape-{}", std::process::id());
+    let session = "escape";
+    let shell = format!(
+        "env HOME={} XDG_STATE_HOME={} bash --noprofile --norc",
+        home.display(),
+        temp.path().join("state").display()
+    );
+    assert!(
+        Command::new("tmux")
+            .args([
+                "-L",
+                &socket,
+                "new-session",
+                "-d",
+                "-x",
+                "80",
+                "-y",
+                "24",
+                "-s",
+                session,
+                "-c",
+                repo.to_str().unwrap(),
+                &shell,
+            ])
+            .status()
+            .await
+            .unwrap()
+            .success()
+    );
+    tmux_send_text(
+        &socket,
+        session,
+        &format!("{} -1 cancel", env!("CARGO_BIN_EXE_a")),
+    )
+    .await;
+    tmux_send_key(&socket, session, "Enter").await;
+    wait_for_tmux_text(&socket, session, "escape-started").await;
+    tmux_send_hex(&socket, session, "1b").await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let current = Command::new("tmux")
+        .args([
+            "-L",
+            &socket,
+            "display-message",
+            "-p",
+            "-t",
+            session,
+            "#{pane_current_command}",
+        ])
+        .output()
+        .await
+        .unwrap();
+    let pane = tmux_history(&socket, session).await;
+    let _ = Command::new("tmux")
+        .args(["-L", &socket, "kill-server"])
+        .status()
+        .await;
+    assert_eq!(
+        String::from_utf8_lossy(&current.stdout).trim(),
+        "bash",
+        "{pane:?}"
+    );
+    assert!(pane.contains("× bash  cancelled"), "{pane:?}");
+    assert_eq!(pane.matches("escape-finished").count(), 1, "{pane:?}");
 }
 
 async fn tmux_send_text(socket: &str, session: &str, text: &str) {
