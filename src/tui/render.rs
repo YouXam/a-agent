@@ -14,6 +14,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::model::{StreamEvent, ToolResult};
 use crate::provider::EventSink;
 
+const GENERATION_ID: &str = "__a_generation";
+
 #[derive(Debug, Clone, Copy)]
 pub struct RenderLimits {
     pub tool_input_max_bytes: usize,
@@ -164,6 +166,7 @@ impl InlineRenderer {
 
     pub fn render_status(&self, message: &str) -> io::Result<()> {
         self.with_state(|state| {
+            state.finish_generation();
             state.finish_open_lines()?;
             write_styled(
                 &mut state.writer,
@@ -237,7 +240,11 @@ impl InlineRenderer {
 
     fn render_event(&self, event: StreamEvent) -> io::Result<()> {
         self.with_state(|state| {
+            if !matches!(&event, StreamEvent::GenerationStart) {
+                state.finish_generation();
+            }
             match event {
+                StreamEvent::GenerationStart => state.start_generation()?,
                 StreamEvent::ReasoningDelta { delta } => state.reasoning_delta(&delta)?,
                 StreamEvent::TextDelta { delta } => state.assistant_delta(&delta)?,
                 StreamEvent::ToolCallStart { id, name } => {
@@ -297,6 +304,24 @@ impl InlineRenderer {
 }
 
 impl State {
+    fn start_generation(&mut self) -> io::Result<()> {
+        self.finish_open_lines()?;
+        if let Some(live) = &mut self.live {
+            live.reserve_generation();
+            live.start(GENERATION_ID, "thinking".into());
+        }
+        Ok(())
+    }
+
+    fn finish_generation(&mut self) {
+        if let Some(live) = &mut self.live
+            && live.entries.contains_key(GENERATION_ID)
+        {
+            live.finish(GENERATION_ID);
+            live.restore_for_commit();
+        }
+    }
+
     fn reasoning_delta(&mut self, delta: &str) -> io::Result<()> {
         self.reasoning_buffer.push_str(delta);
         if !self.reasoning_announced {
@@ -479,6 +504,14 @@ impl State {
             Some(tool) => {
                 if tool.output.total_bytes > 0 {
                     tool.output.limited(self.limits.tool_output_max_lines)
+                } else if tool.name == "bash" {
+                    let output = bash_visible_output(&result.output);
+                    limited_text(
+                        &output,
+                        self.limits.tool_output_max_bytes,
+                        self.limits.tool_output_max_lines,
+                        true,
+                    )
                 } else {
                     limited_text(
                         &result.output,
@@ -568,6 +601,17 @@ impl LiveTools {
         self.visible_lines = self.max_lines.min(rows_per_tool.saturating_sub(1));
         let desired = tool_count.saturating_mul(self.visible_lines.saturating_add(1));
         let height = desired.min(available_rows) as u16;
+        self.reserve_rows(height);
+    }
+
+    fn reserve_generation(&mut self) {
+        self.reserve_rows(1);
+    }
+
+    fn reserve_rows(&mut self, height: u16) {
+        if self.reserved {
+            return;
+        }
         if height > 0 {
             let mut stdout = io::stdout();
             for _ in 0..height {
@@ -758,7 +802,6 @@ fn live_tool_message(tool: &ToolDisplay, max_lines: usize, terminal_width: usize
         return label;
     }
     let mut message = label;
-    let output_line_count = output.lines.len();
     for (index, line) in output.lines.into_iter().enumerate() {
         let prefix = if output.truncated && index == 0 {
             "  … "
@@ -771,10 +814,27 @@ fn live_tool_message(tool: &ToolDisplay, max_lines: usize, terminal_width: usize
         message.push_str(prefix);
         message.push_str(&line);
     }
-    for _ in output_line_count..max_lines {
-        message.push_str("\n    ");
-    }
     message
+}
+
+fn bash_visible_output(raw: &str) -> String {
+    let mut lines = raw.lines().collect::<Vec<_>>();
+    if lines
+        .last()
+        .is_some_and(|line| line.starts_with("[exit code: ") && line.ends_with(']'))
+    {
+        lines.pop();
+    }
+    if lines.last().is_some_and(|line| {
+        *line == "[bash cancelled]"
+            || (line.starts_with("[bash timed out after ") && line.ends_with(']'))
+    }) {
+        lines.pop();
+    }
+    while lines.last().is_some_and(|line| line.is_empty()) {
+        lines.pop();
+    }
+    lines.join("\n")
 }
 
 fn clean_terminal_line(value: &str) -> String {
@@ -1053,6 +1113,20 @@ fn render_bash_output(
     color_enabled: bool,
     content: &LimitedText,
 ) -> io::Result<()> {
+    if content.lines.is_empty() {
+        write_styled(writer, color_enabled, "  ", Color::DarkGrey, false)?;
+        if color_enabled {
+            writeln!(
+                writer,
+                "{}",
+                "(no output)"
+                    .with(Color::DarkGrey)
+                    .attribute(Attribute::Italic)
+            )?;
+        } else {
+            writeln!(writer, "(no output)")?;
+        }
+    }
     for line in &content.lines {
         write_styled(writer, color_enabled, "  │ ", Color::DarkGrey, false)?;
         write_styled(
@@ -1257,6 +1331,28 @@ mod tests {
         let contents = terminal.contents();
         assert!(!contents.contains("bash  $ cargo test"), "{contents}");
         assert!(contents.contains("read  src/lib.rs"), "{contents}");
+    }
+
+    #[test]
+    fn live_parallel_tools_without_output_are_adjacent() {
+        let terminal = InMemoryTerm::new(30, 100);
+        let target = ProgressDrawTarget::term_like(Box::new(terminal.clone()));
+        let mut live = LiveTools::with_draw_target(target, 6, 100);
+        for index in 0..3 {
+            let mut bash = ToolDisplay::new("bash".into(), 1024, 4096);
+            bash.arguments.push(r#"{"command":"sleep 20"}"#);
+            live.start(&format!("bash-{index}"), live_tool_message(&bash, 6, 100));
+        }
+
+        let contents = terminal.contents();
+        let positions = contents
+            .lines()
+            .enumerate()
+            .filter_map(|(index, line)| line.contains("bash  $ sleep 20").then_some(index))
+            .collect::<Vec<_>>();
+        assert_eq!(positions.len(), 3, "{contents}");
+        assert_eq!(positions[1] - positions[0], 1, "{contents}");
+        assert_eq!(positions[2] - positions[1], 1, "{contents}");
     }
 
     #[test]

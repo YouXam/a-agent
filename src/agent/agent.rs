@@ -76,6 +76,7 @@ impl Agent {
                 system_prompt: self.system_prompt.clone(),
                 messages,
             };
+            events.emit(StreamEvent::GenerationStart);
             let turn = self
                 .provider
                 .stream_turn(request, events.clone(), cancel.clone())

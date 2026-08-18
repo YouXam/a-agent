@@ -219,6 +219,37 @@ fn tool_input_and_output_are_bounded_with_visible_truncation() {
 }
 
 #[test]
+fn bash_without_output_renders_one_italic_placeholder_without_metadata() {
+    let writer = SharedWriter::default();
+    let renderer = InlineRenderer::new(writer.clone(), false, true);
+    let sink = renderer.event_sink();
+    sink.emit(StreamEvent::ToolCallStart {
+        id: "sleep".into(),
+        name: "bash".into(),
+    });
+    sink.emit(StreamEvent::ToolCallArgsDelta {
+        id: "sleep".into(),
+        delta: serde_json::json!({"command":"sleep 20"}).to_string(),
+    });
+    sink.emit(StreamEvent::ToolCallEnd { id: "sleep".into() });
+    sink.emit(StreamEvent::ToolExecutionEnd {
+        id: "sleep".into(),
+        result: ToolResult::success("sleep", "\n[exit code: 0]"),
+    });
+
+    let bytes = writer.bytes();
+    let plain = String::from_utf8(strip_ansi_escapes::strip(&bytes)).unwrap();
+    assert!(plain.contains("✓ bash  exit 0"), "{plain}");
+    assert!(plain.contains("  $ sleep 20"), "{plain}");
+    assert!(plain.contains("  (no output)"), "{plain}");
+    assert!(!plain.contains("[exit code:"), "{plain}");
+    assert!(
+        bytes.windows(4).any(|bytes| bytes == b"\x1b[3m"),
+        "{bytes:?}"
+    );
+}
+
+#[test]
 fn fish_script_has_metadata_hooks_dedicated_ai_read_and_mode_bindings() {
     let script = fish_script();
     assert!(script.contains("--on-event fish_preexec"));

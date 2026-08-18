@@ -288,6 +288,7 @@ async fn interactive_tui_is_inline_aligned_and_does_not_duplicate_input() {
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("content-type", "text/event-stream")
+                .set_delay(std::time::Duration::from_millis(500))
                 .set_body_string(sse),
         )
         .mount(&server)
@@ -360,13 +361,10 @@ api_key = "secret"
             .unwrap()
             .success()
     );
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    let capture = Command::new("tmux")
-        .args(["-L", &socket, "capture-pane", "-p", "-t", session])
-        .output()
-        .await
-        .unwrap();
-    let screen = String::from_utf8(capture.stdout).unwrap();
+    let loading = wait_for_tmux_text(&socket, session, "thinking").await;
+    assert!(loading.contains("thinking"), "{loading:?}");
+    let screen = wait_for_tmux_text(&socket, session, "Ready.").await;
+    let history = tmux_history(&socket, session).await;
     let alternate = Command::new("tmux")
         .args([
             "-L",
@@ -393,6 +391,13 @@ api_key = "secret"
     assert!(
         screen.lines().any(|line| line.starts_with("│ Ready.")),
         "{screen:?}"
+    );
+    assert!(!history.contains("thinking"), "{history:?}");
+    assert!(
+        !["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+            .iter()
+            .any(|spinner| history.contains(spinner)),
+        "{history:?}"
     );
 
     assert!(

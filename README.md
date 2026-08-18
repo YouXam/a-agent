@@ -156,6 +156,8 @@ fall back to labeled input/output blocks. Configure display limits with
 `ui.tool_output_max_lines`.
 The transient parallel-tool panel keeps the latest
 `ui.tool_live_output_lines` lines per running tool.
+A transient `thinking` spinner is shown while each model response is waiting
+for its first reasoning, text, or tool-call event.
 
 ## Fish
 

@@ -125,6 +125,7 @@ impl ModelTurn {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamEvent {
+    GenerationStart,
     TextDelta { delta: String },
     ReasoningDelta { delta: String },
     ToolCallStart { id: String, name: String },

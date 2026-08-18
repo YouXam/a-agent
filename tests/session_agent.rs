@@ -316,9 +316,12 @@ async fn one_logical_turn_runs_tools_until_final_response() {
         "system".into(),
         10,
     );
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let captured_events = events.clone();
+    let sink = EventSink::new(move |event| captured_events.lock().unwrap().push(event));
 
     let result = agent
-        .submit("fix it", EventSink::default(), CancellationToken::new())
+        .submit("fix it", sink, CancellationToken::new())
         .await
         .unwrap();
     assert_eq!(result.final_text.as_deref(), Some("fixed"));
@@ -327,6 +330,15 @@ async fn one_logical_turn_runs_tools_until_final_response() {
             .request_count
             .0
             .load(std::sync::atomic::Ordering::SeqCst),
+        2
+    );
+    assert_eq!(
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| matches!(event, a_agent::model::StreamEvent::GenerationStart))
+            .count(),
         2
     );
     assert_eq!(
