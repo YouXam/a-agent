@@ -1,5 +1,9 @@
 # a-agent Fish integration. Records command metadata only; no output is captured.
 
+if not set -q __a_fish_session_key
+    set -g __a_fish_session_key (string join '' a_fish_ $fish_pid _ (date +%s) _ (random) _ (random))
+end
+
 function __a_preexec --on-event fish_preexec
     set -g __a_command $argv[1]
     set -g __a_cwd $PWD
@@ -11,10 +15,6 @@ function __a_postexec --on-event fish_postexec
     if not set -q __a_started_at
         return
     end
-    if string match -q '*--fish-ai*' -- "$__a_command"
-        set -e A_FISH_AI_PROMPT
-        return
-    end
     set -l exit_code $execution_snapshot[1]
     set -l pipe_status (string join ' ' $execution_snapshot[2..])
     set -l finished_at (date +%s%3N)
@@ -24,6 +24,7 @@ function __a_postexec --on-event fish_postexec
         --command "$__a_command" \
         --exit-code "$exit_code" \
         --pipe-status "$pipe_status" \
+        --fish-session-key "$__a_fish_session_key" \
         --started-at "$__a_started_at" \
         --duration-ms "$duration_ms" >/dev/null 2>&1
 end
@@ -42,10 +43,10 @@ function __a_ai_prompt
     set -l prompt
     if read --local --line --command "$initial" --prompt __a_render_ai_prompt prompt
         if test -n (string trim -- "$prompt")
-            set -gx A_FISH_AI_PROMPT "$prompt"
-            commandline -r 'a --fish-ai --resume --one-turn'
-            commandline -f execute
-            return
+            set -lx A_FISH_AI_PROMPT "$prompt"
+            command a --fish-ai --fish-session-key "$__a_fish_session_key" --one-turn
+            set -l agent_status $status
+            return $agent_status
         end
     end
     commandline -f repaint

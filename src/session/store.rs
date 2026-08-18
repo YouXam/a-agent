@@ -12,6 +12,7 @@ const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS sessions (
     id              TEXT PRIMARY KEY,
     cwd             TEXT NOT NULL,
+    client_session_key TEXT,
     title           TEXT,
     head_item_id    TEXT,
     provider_type   TEXT NOT NULL,
@@ -45,6 +46,7 @@ CREATE TABLE IF NOT EXISTS provider_state (
 CREATE TABLE IF NOT EXISTS shell_history (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     cwd             TEXT NOT NULL,
+    client_session_key TEXT,
     command         TEXT NOT NULL,
     exit_code       INTEGER,
     pipe_status     TEXT,
@@ -52,8 +54,9 @@ CREATE TABLE IF NOT EXISTS shell_history (
     duration_ms     INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_shell_cwd_time ON shell_history(cwd, started_at DESC);
-PRAGMA user_version = 1;
 "#;
+
+pub const TURN_INTERRUPTED_NOTICE: &str = "[The user interrupted the previous turn. Do not continue or retry its unfinished task unless the user explicitly asks you to.]";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Session {
@@ -72,6 +75,7 @@ pub struct NewSession {
     pub cwd: String,
     pub provider_type: String,
     pub model: String,
+    pub client_session_key: Option<String>,
 }
 
 impl NewSession {
@@ -84,7 +88,13 @@ impl NewSession {
             cwd: cwd.into(),
             provider_type: provider_type.into(),
             model: model.into(),
+            client_session_key: None,
         }
+    }
+
+    pub fn with_client_session_key(mut self, key: impl Into<String>) -> Self {
+        self.client_session_key = Some(key.into());
+        self
     }
 }
 
@@ -124,6 +134,7 @@ impl SessionStore {
         connection.pragma_update(None, "synchronous", "NORMAL")?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.execute_batch(SCHEMA)?;
+        migrate_client_session_keys(&connection)?;
         Ok(Self { connection })
     }
 
@@ -131,8 +142,8 @@ impl SessionStore {
         let id = format!("a_{}", Uuid::new_v4().simple());
         let now = now_millis();
         self.connection.execute(
-            "INSERT INTO sessions (id, cwd, provider_type, model, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
-            params![id, new.cwd, new.provider_type, new.model, now],
+            "INSERT INTO sessions (id, cwd, client_session_key, provider_type, model, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+            params![id, new.cwd, new.client_session_key, new.provider_type, new.model, now],
         )?;
         self.get_session(&id)?.context("new session disappeared")
     }
@@ -159,11 +170,42 @@ impl SessionStore {
             .map_err(Into::into)
     }
 
+    pub fn find_client_session(&self, cwd: &str, key: &str) -> Result<Option<Session>> {
+        self.connection
+            .query_row(
+                "SELECT id, cwd, title, head_item_id, provider_type, model, created_at, updated_at FROM sessions WHERE cwd = ?1 AND client_session_key = ?2 LIMIT 1",
+                params![cwd, key],
+                row_to_session,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn append_item(
         &mut self,
         session_id: &str,
         role: Role,
         blocks: Vec<ContentBlock>,
+    ) -> Result<ConversationItem> {
+        let kind = item_kind(role, &blocks);
+        self.append_item_with_kind(session_id, role, blocks, kind)
+    }
+
+    pub fn append_turn_interrupted(&mut self, session_id: &str) -> Result<ConversationItem> {
+        self.append_item_with_kind(
+            session_id,
+            Role::User,
+            vec![ContentBlock::Text(TURN_INTERRUPTED_NOTICE.into())],
+            "turn_interrupted",
+        )
+    }
+
+    fn append_item_with_kind(
+        &mut self,
+        session_id: &str,
+        role: Role,
+        blocks: Vec<ContentBlock>,
+        kind: &str,
     ) -> Result<ConversationItem> {
         let parent_id = self
             .get_session(session_id)?
@@ -173,7 +215,6 @@ impl SessionStore {
         let created_at = now_millis();
         let content_json = serde_json::to_string(&blocks)?;
         let role_text = role_to_str(role);
-        let kind = item_kind(role, &blocks);
         let transaction = self.connection.transaction()?;
         transaction.execute(
             "INSERT INTO conversation_items (id, session_id, parent_id, role, kind, content_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -237,11 +278,13 @@ impl SessionStore {
     }
 
     pub fn user_checkpoints(&self, session_id: &str) -> Result<Vec<ConversationItem>> {
-        Ok(self
-            .active_branch(session_id)?
-            .into_iter()
-            .filter(|item| item.role == Role::User)
-            .collect())
+        let mut checkpoints = Vec::new();
+        for item in self.active_branch(session_id)? {
+            if item.role == Role::User && self.stored_item_kind(&item.id)? == "user_message" {
+                checkpoints.push(item);
+            }
+        }
+        Ok(checkpoints)
     }
 
     pub fn count_items(&self, session_id: &str) -> Result<usize> {
@@ -283,6 +326,7 @@ impl SessionStore {
     pub fn record_shell_history(
         &self,
         cwd: &str,
+        client_session_key: Option<&str>,
         command: &str,
         exit_code: Option<i32>,
         started_at: i64,
@@ -290,17 +334,25 @@ impl SessionStore {
         pipe_status: Option<&str>,
     ) -> Result<()> {
         self.connection.execute(
-            "INSERT INTO shell_history (cwd, command, exit_code, pipe_status, started_at, duration_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![cwd, command, exit_code, pipe_status, started_at, duration_ms],
+            "INSERT INTO shell_history (cwd, client_session_key, command, exit_code, pipe_status, started_at, duration_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![cwd, client_session_key, command, exit_code, pipe_status, started_at, duration_ms],
         )?;
         Ok(())
     }
 
-    pub fn recent_shell_history(&self, cwd: &str, limit: usize) -> Result<Vec<ShellHistoryItem>> {
-        let mut statement = self.connection.prepare(
-            "SELECT id, cwd, command, exit_code, pipe_status, started_at, duration_ms FROM shell_history WHERE cwd = ?1 ORDER BY started_at DESC, id DESC LIMIT ?2",
-        )?;
-        let rows = statement.query_map(params![cwd, limit], |row| {
+    pub fn recent_shell_history(
+        &self,
+        cwd: &str,
+        client_session_key: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ShellHistoryItem>> {
+        let query = if client_session_key.is_some() {
+            "SELECT id, cwd, command, exit_code, pipe_status, started_at, duration_ms FROM shell_history WHERE cwd = ?1 AND client_session_key = ?2 ORDER BY started_at DESC, id DESC LIMIT ?3"
+        } else {
+            "SELECT id, cwd, command, exit_code, pipe_status, started_at, duration_ms FROM shell_history WHERE cwd = ?1 ORDER BY started_at DESC, id DESC LIMIT ?3"
+        };
+        let mut statement = self.connection.prepare(query)?;
+        let rows = statement.query_map(params![cwd, client_session_key, limit], |row| {
             Ok(ShellHistoryItem {
                 id: row.get(0)?,
                 cwd: row.get(1)?,
@@ -312,6 +364,16 @@ impl SessionStore {
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    fn stored_item_kind(&self, item_id: &str) -> Result<String> {
+        self.connection
+            .query_row(
+                "SELECT kind FROM conversation_items WHERE id = ?1",
+                [item_id],
+                |row| row.get(0),
+            )
             .map_err(Into::into)
     }
 
@@ -335,6 +397,37 @@ pub fn default_database_path(home: &Path) -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".local/state"))
         .join("a/sessions.db")
+}
+
+fn migrate_client_session_keys(connection: &Connection) -> Result<()> {
+    let session_column_exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('sessions') WHERE name = 'client_session_key')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !session_column_exists {
+        connection.execute(
+            "ALTER TABLE sessions ADD COLUMN client_session_key TEXT",
+            [],
+        )?;
+    }
+    let history_column_exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('shell_history') WHERE name = 'client_session_key')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !history_column_exists {
+        connection.execute(
+            "ALTER TABLE shell_history ADD COLUMN client_session_key TEXT",
+            [],
+        )?;
+    }
+    connection.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_client_key ON sessions(cwd, client_session_key) WHERE client_session_key IS NOT NULL;
+         CREATE INDEX IF NOT EXISTS idx_shell_client_time ON shell_history(cwd, client_session_key, started_at DESC);
+         PRAGMA user_version = 2;",
+    )?;
+    Ok(())
 }
 
 fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {

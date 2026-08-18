@@ -50,9 +50,16 @@ fn rejects_unknown_options() {
 
 #[test]
 fn parses_hidden_fish_ai_mode() {
-    let parsed = parser(&["--fish-ai", "-r", "-1", "fix it"]);
+    let parsed = parser(&[
+        "--fish-ai",
+        "--fish-session-key",
+        "fish-123",
+        "-1",
+        "fix it",
+    ]);
     assert!(parsed.fish_ai);
-    assert!(parsed.resume);
+    assert!(!parsed.resume);
+    assert_eq!(parsed.fish_session_key.as_deref(), Some("fish-123"));
     assert!(parsed.one_turn);
     assert_eq!(parsed.prompt.as_deref(), Some("fix it"));
 }
@@ -74,6 +81,8 @@ fn parses_internal_shell_history_record() {
             "45",
             "--pipe-status",
             "101 0",
+            "--fish-session-key",
+            "fish-123",
         ]
         .into_iter()
         .map(str::to_owned),
@@ -87,4 +96,5 @@ fn parses_internal_shell_history_record() {
     assert_eq!(record.started_at, 123);
     assert_eq!(record.duration_ms, Some(45));
     assert_eq!(record.pipe_status.as_deref(), Some("101 0"));
+    assert_eq!(record.fish_session_key.as_deref(), Some("fish-123"));
 }

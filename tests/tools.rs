@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use a_agent::model::{ToolCall, ToolResult};
+use a_agent::provider::EventSink;
 use a_agent::tools::bash::{BashArgs, BashOptions, execute_bash, execute_bash_cancellable};
 use a_agent::tools::patch::{affected_paths, apply_patch};
 use a_agent::tools::read::{ReadArgs, read_text_file};
@@ -221,6 +222,32 @@ async fn bash_cancellation_terminates_the_process_group() {
     // SAFETY: signal 0 only checks whether the recorded child PID still exists.
     let alive = unsafe { libc::kill(pid, 0) } == 0;
     assert!(!alive, "background child {pid} survived cancellation");
+}
+
+#[tokio::test]
+async fn core_bash_marks_user_cancellation_as_a_tool_error() {
+    let temp = tempdir().unwrap();
+    let executor = CoreToolExecutor::new(
+        temp.path().to_path_buf(),
+        1000,
+        Duration::from_secs(30),
+        1024,
+    );
+    let cancel = CancellationToken::new();
+    let trigger = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        trigger.cancel();
+    });
+    let result = executor
+        .execute_with(
+            ToolCall::new("cancelled", "bash", r#"{"command":"sleep 10"}"#),
+            EventSink::default(),
+            cancel,
+        )
+        .await;
+    assert!(result.is_error);
+    assert!(result.output.contains("[bash cancelled]"));
 }
 
 #[tokio::test]

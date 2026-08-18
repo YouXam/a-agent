@@ -26,6 +26,7 @@ pub struct CliArgs {
     pub version: bool,
     pub install_fish: bool,
     pub fish_ai: bool,
+    pub fish_session_key: Option<String>,
     pub shell_record: Option<ShellRecordArgs>,
 }
 
@@ -37,6 +38,7 @@ pub struct ShellRecordArgs {
     pub started_at: i64,
     pub duration_ms: Option<i64>,
     pub pipe_status: Option<String>,
+    pub fish_session_key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,6 +82,15 @@ pub fn parse_args_with(
                 "-V" | "--version" => parsed.version = true,
                 "--install-fish" => parsed.install_fish = true,
                 "--fish-ai" => parsed.fish_ai = true,
+                "--fish-session-key" => {
+                    parsed.fish_session_key = Some(
+                        iter.next()
+                            .filter(|value| !value.is_empty())
+                            .ok_or_else(|| {
+                                CliError("--fish-session-key requires a value".into())
+                            })?,
+                    );
+                }
                 "--session" => {
                     parsed.resume = true;
                     parsed.resume_session_id = Some(
@@ -121,6 +132,7 @@ fn parse_shell_record(args: &[String]) -> Result<CliArgs, CliError> {
     let mut started_at = None;
     let mut duration_ms = None;
     let mut pipe_status = None;
+    let mut fish_session_key = None;
     let mut index = 0;
     while index < args.len() {
         let key = &args[index];
@@ -152,6 +164,7 @@ fn parse_shell_record(args: &[String]) -> Result<CliArgs, CliError> {
                 )
             }
             "--pipe-status" => pipe_status = Some(value.clone()),
+            "--fish-session-key" => fish_session_key = Some(value.clone()),
             _ => return Err(CliError(format!("unknown shell record option: {key}"))),
         }
         index += 2;
@@ -165,6 +178,7 @@ fn parse_shell_record(args: &[String]) -> Result<CliArgs, CliError> {
                 .ok_or_else(|| CliError("__record-shell requires --started-at".into()))?,
             duration_ms,
             pipe_status,
+            fish_session_key,
         }),
         ..CliArgs::default()
     })

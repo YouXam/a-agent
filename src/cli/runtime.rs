@@ -57,6 +57,7 @@ pub async fn run() -> Result<i32> {
             .unwrap_or(5000);
         store.record_shell_history(
             &record.cwd,
+            record.fish_session_key.as_deref(),
             &record.command,
             record.exit_code,
             record.started_at,
@@ -106,10 +107,13 @@ pub async fn run() -> Result<i32> {
     let cwd_text = cwd.to_string_lossy().into_owned();
     let session = resolve_session(&mut store, &args, &cwd_text, &config)?;
     timing.mark("session_lookup");
-    let shell_history =
-        store.recent_shell_history(&cwd_text, config.context.shell_history_count)?;
+    let shell_history = store.recent_shell_history(
+        &cwd_text,
+        args.fish_session_key.as_deref(),
+        config.context.shell_history_count,
+    )?;
     let mut provider_config = config.provider.clone();
-    if args.resume {
+    if args.resume || args.fish_session_key.is_some() {
         provider_config.kind = ProviderKind::parse(&session.provider_type)?;
         provider_config.model = session.model.clone();
     }
@@ -239,6 +243,7 @@ async fn run_turn(agent: &Agent, renderer: &InlineRenderer, prompt: &str) -> Res
     }
     cancel.cancel();
     let _ = turn.await;
+    agent.record_interruption()?;
     drop(events);
     drop(raw_mode);
     renderer.render_status("cancelled")?;
@@ -318,11 +323,17 @@ fn resolve_session(
     {
         return Ok(session);
     }
-    store.create_session(NewSession::new(
-        cwd,
-        config.provider.kind.as_str(),
-        &config.provider.model,
-    ))
+    if let Some(key) = &args.fish_session_key
+        && let Some(session) = store.find_client_session(cwd, key)?
+    {
+        return Ok(session);
+    }
+    let mut new_session =
+        NewSession::new(cwd, config.provider.kind.as_str(), &config.provider.model);
+    if let Some(key) = &args.fish_session_key {
+        new_session = new_session.with_client_session_key(key);
+    }
+    store.create_session(new_session)
 }
 
 fn resolve_targets(cwd: &Path, files: &[String]) -> Result<Vec<PathBuf>> {
@@ -393,7 +404,9 @@ fn contextual_prompt(prompt: &str, stdin: Option<&str>, shell: &[ShellHistoryIte
             })
             .collect::<Vec<_>>()
             .join("\n");
-        sections.push(format!("Recent shell activity:\n{commands}"));
+        sections.push(format!(
+            "Recent shell commands recorded by the Fish integration (these commands are visible to you):\n{commands}"
+        ));
     }
     if let Some(stdin) = stdin {
         sections.push(format!("User-provided stdin:\n\n{stdin}"));

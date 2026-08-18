@@ -212,7 +212,9 @@ fn fish_script_has_metadata_hooks_dedicated_ai_read_and_mode_bindings() {
     assert!(script.contains("--on-event fish_preexec"));
     assert!(script.contains("--on-event fish_postexec"));
     assert!(script.contains("__record-shell"));
-    assert!(script.contains("--resume --one-turn"));
+    assert!(script.contains("--fish-session-key"));
+    assert!(script.contains("--one-turn"));
+    assert!(!script.contains("--resume --one-turn"));
     assert!(script.contains("--fish-ai"));
     assert!(script.contains("A_FISH_AI_PROMPT"));
     assert!(script.contains("[AI] "));
@@ -312,14 +314,13 @@ async fn new_fish_has_immediate_ai_prompt_without_shell_completion_and_invokes_a
     tmux_key(&socket, session, "Enter").await;
     let pane = wait_for_pane(&socket, session, "agent invoked").await;
     let calls = std::fs::read_to_string(&log).unwrap();
-    assert!(
-        calls.contains("--fish-ai|--resume|--one-turn|prompt=echo ok|"),
-        "{calls:?}"
-    );
+    assert!(calls.contains("--fish-ai|--fish-session-key|"), "{calls:?}");
+    assert!(calls.contains("--one-turn|prompt=echo ok|"), "{calls:?}");
+    assert!(!pane.contains("a --fish-ai"), "{pane:?}");
     assert!(pane.contains("agent invoked"), "{pane:?}");
-    let final_pane = wait_for_last_line(&socket, session, |line| line.contains("[0]#")).await;
+    let final_pane = wait_for_last_line(&socket, session, |line| line.contains("[1]#")).await;
     assert!(
-        last_visible_line(&final_pane).contains("[0]#"),
+        last_visible_line(&final_pane).contains("[1]#"),
         "{final_pane:?}"
     );
     let _ = Command::new("tmux")

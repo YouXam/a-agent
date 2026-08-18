@@ -205,5 +205,6 @@ fn system_prompt_has_active_rules_and_skill_references_only() {
     assert!(prompt.contains("Targeted files:\n- /repo/src/a.rs"));
     assert!(prompt.contains("relative to the cwd"));
     assert!(prompt.contains("Before any git command, first confirm that .git exists"));
+    assert!(prompt.contains("commands are directly available context"));
     assert!(!prompt.contains("SECRET BODY"));
 }

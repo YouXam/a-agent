@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use a_agent::fish::install_to;
+use a_agent::session::TURN_INTERRUPTED_NOTICE;
 use tempfile::tempdir;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -102,6 +103,73 @@ api_key_env = "TEST_API_KEY"
     let second_body = String::from_utf8(requests[1].body.clone()).unwrap();
     assert!(second_body.contains("hello from model"));
     assert!(second_body.contains("continue"));
+}
+
+#[tokio::test]
+async fn fish_session_keys_isolate_conversations_in_the_same_cwd() {
+    let server = MockServer::start().await;
+    let count = Arc::new(AtomicUsize::new(0));
+    let response_count = count.clone();
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(move |_: &wiremock::Request| {
+            let text = match response_count.fetch_add(1, Ordering::SeqCst) {
+                0 => "reply-from-one",
+                1 => "reply-from-two",
+                _ => "reply-from-one-again",
+            };
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(format!(
+                    "data: {{\"type\":\"response.output_text.delta\",\"delta\":{}}}\n\ndata: {{\"type\":\"response.completed\",\"response\":{{\"usage\":{{}}}}}}\n\ndata: [DONE]\n\n",
+                    serde_json::to_string(text).unwrap()
+                ))
+        })
+        .mount(&server)
+        .await;
+
+    let temp = tempdir().unwrap();
+    let home = temp.path().join("home");
+    let repo = temp.path().join("repo");
+    let state = temp.path().join("state");
+    fs::create_dir_all(home.join(".config/a")).unwrap();
+    fs::create_dir_all(&repo).unwrap();
+    fs::write(
+        home.join(".config/a/config.toml"),
+        format!(
+            "[provider]\ntype = \"responses\"\nbase_url = \"{}/v1\"\nmodel = \"test-model\"\napi_key = \"secret\"\n",
+            server.uri()
+        ),
+    )
+    .unwrap();
+
+    for (key, prompt) in [
+        ("fish-one", "first prompt"),
+        ("fish-two", "second prompt"),
+        ("fish-one", "third prompt"),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_a"))
+            .args(["--fish-ai", "--fish-session-key", key, "-1", prompt])
+            .current_dir(&repo)
+            .env("HOME", &home)
+            .env("XDG_STATE_HOME", &state)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 3);
+    let second = String::from_utf8(requests[1].body.clone()).unwrap();
+    let third = String::from_utf8(requests[2].body.clone()).unwrap();
+    assert!(!second.contains("reply-from-one"), "{second}");
+    assert!(third.contains("reply-from-one"), "{third}");
+    assert!(!third.contains("reply-from-two"), "{third}");
 }
 
 #[tokio::test]
@@ -463,8 +531,9 @@ api_key = "secret"
         .await;
     assert_eq!(requests.len(), 1, "{pane:?}");
     assert_eq!(pane.matches("fix previous failure").count(), 1, "{pane:?}");
+    assert!(!pane.contains("a --fish-ai"), "{pane:?}");
     let body = String::from_utf8(requests[0].body.clone()).unwrap();
-    assert!(body.contains("Recent shell activity"), "{body}");
+    assert!(body.contains("Recent shell commands recorded"), "{body}");
     assert!(body.contains("`false` -> exit 1"), "{body}");
 }
 
@@ -607,7 +676,7 @@ async fn escape_cancels_a_running_bash_tool_and_returns_to_the_shell() {
     }
     let server = MockServer::start().await;
     let command = "echo escape-started; sleep 10; echo escape-finished";
-    let body = format!(
+    let tool_body = format!(
         "data: {}\n\ndata: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
         serde_json::json!({
             "type":"response.output_item.added",
@@ -619,13 +688,25 @@ async fn escape_cancels_a_running_bash_tool_and_returns_to_the_shell() {
         }),
         serde_json::json!({"type":"response.completed","response":{"usage":{}}}),
     );
+    let count = Arc::new(AtomicUsize::new(0));
+    let response_count = count.clone();
     Mock::given(method("POST"))
         .and(path("/v1/responses"))
-        .respond_with(
+        .respond_with(move |_: &wiremock::Request| {
+            let body = if response_count.fetch_add(1, Ordering::SeqCst) == 0 {
+                tool_body.clone()
+            } else {
+                concat!(
+                    "data: {\"type\":\"response.output_text.delta\",\"delta\":\"fresh after cancel\"}\n\n",
+                    "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{}}}\n\n",
+                    "data: [DONE]\n\n"
+                )
+                .to_owned()
+            };
             ResponseTemplate::new(200)
                 .insert_header("content-type", "text/event-stream")
-                .set_body_string(body),
-        )
+                .set_body_string(body)
+        })
         .mount(&server)
         .await;
 
@@ -675,7 +756,10 @@ async fn escape_cancels_a_running_bash_tool_and_returns_to_the_shell() {
     tmux_send_text(
         &socket,
         session,
-        &format!("{} -1 cancel", env!("CARGO_BIN_EXE_a")),
+        &format!(
+            "{} --fish-session-key escape-key -1 cancel",
+            env!("CARGO_BIN_EXE_a")
+        ),
     )
     .await;
     tmux_send_key(&socket, session, "Enter").await;
@@ -696,10 +780,6 @@ async fn escape_cancels_a_running_bash_tool_and_returns_to_the_shell() {
         .await
         .unwrap();
     let pane = tmux_history(&socket, session).await;
-    let _ = Command::new("tmux")
-        .args(["-L", &socket, "kill-server"])
-        .status()
-        .await;
     assert_eq!(
         String::from_utf8_lossy(&current.stdout).trim(),
         "bash",
@@ -707,6 +787,30 @@ async fn escape_cancels_a_running_bash_tool_and_returns_to_the_shell() {
     );
     assert!(pane.contains("× bash  cancelled"), "{pane:?}");
     assert_eq!(pane.matches("escape-finished").count(), 1, "{pane:?}");
+
+    tmux_send_text(
+        &socket,
+        session,
+        &format!(
+            "{} --fish-session-key escape-key -1 next",
+            env!("CARGO_BIN_EXE_a")
+        ),
+    )
+    .await;
+    tmux_send_key(&socket, session, "Enter").await;
+    let resumed = wait_for_tmux_text(&socket, session, "fresh after cancel").await;
+    let requests = server.received_requests().await.unwrap();
+    let _ = Command::new("tmux")
+        .args(["-L", &socket, "kill-server"])
+        .status()
+        .await;
+    assert_eq!(requests.len(), 2, "{resumed:?}");
+    let resumed_body = String::from_utf8(requests[1].body.clone()).unwrap();
+    assert!(
+        resumed_body.contains(TURN_INTERRUPTED_NOTICE),
+        "{resumed_body}"
+    );
+    assert!(resumed_body.contains("next"), "{resumed_body}");
 }
 
 async fn tmux_send_text(socket: &str, session: &str, text: &str) {

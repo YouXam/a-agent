@@ -28,6 +28,9 @@ pub fn build_system_prompt(input: &ContextInput) -> String {
          After modifying code, run relevant validation when practical.\n",
         input.cwd.display()
     );
+    prompt.push_str(
+        "When a user message includes recent shell commands recorded by the Fish integration, those commands are directly available context. Do not claim that you cannot see commands listed there.\n",
+    );
 
     if !input.agents.is_empty() {
         prompt.push_str("\nActive AGENTS.md instructions:\n");

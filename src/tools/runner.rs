@@ -137,6 +137,13 @@ impl ToolExecutor for CoreToolExecutor {
             )),
         };
         match result {
+            Ok(output)
+                if call.name == "bash"
+                    && (output.contains("[bash cancelled]")
+                        || output.contains("[bash timed out after ")) =>
+            {
+                ToolResult::error(call.id, output)
+            }
             Ok(output) => ToolResult::success(call.id, output),
             Err(error) => ToolResult::error(call.id, error.to_string()),
         }

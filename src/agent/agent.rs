@@ -129,4 +129,12 @@ impl Agent {
         ))
         .context("maximum agent cycles reached before a final response")
     }
+
+    pub fn record_interruption(&self) -> Result<()> {
+        self.store
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session store lock poisoned"))?
+            .append_turn_interrupted(&self.session_id)?;
+        Ok(())
+    }
 }

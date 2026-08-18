@@ -3,9 +3,11 @@ use std::sync::{Arc, Mutex};
 use a_agent::agent::Agent;
 use a_agent::model::{ContentBlock, ModelRequest, ModelTurn, Role, ToolCall, ToolResult};
 use a_agent::provider::{EventSink, Provider};
-use a_agent::session::{NewSession, SessionStore};
+use a_agent::session::{NewSession, SessionStore, TURN_INTERRUPTED_NOTICE};
 use a_agent::tools::runner::{ToolExecutor, ToolRunner};
 use async_trait::async_trait;
+use rusqlite::Connection;
+use tempfile::tempdir;
 use tokio_util::sync::CancellationToken;
 
 #[test]
@@ -41,6 +43,75 @@ fn sessions_resume_by_cwd_and_reconstruct_active_branch() {
             .collect::<Vec<_>>(),
         [user.id, assistant.id]
     );
+}
+
+#[test]
+fn client_sessions_are_isolated_by_fish_key_and_cwd() {
+    let mut store = SessionStore::open_in_memory().unwrap();
+    let first = store
+        .create_session(
+            NewSession::new("/repo", "responses", "model").with_client_session_key("fish-one"),
+        )
+        .unwrap();
+    let second = store
+        .create_session(
+            NewSession::new("/repo", "responses", "model").with_client_session_key("fish-two"),
+        )
+        .unwrap();
+    let other_cwd = store
+        .create_session(
+            NewSession::new("/other", "responses", "model").with_client_session_key("fish-one"),
+        )
+        .unwrap();
+
+    assert_eq!(
+        store
+            .find_client_session("/repo", "fish-one")
+            .unwrap()
+            .unwrap()
+            .id,
+        first.id
+    );
+    assert_eq!(
+        store
+            .find_client_session("/repo", "fish-two")
+            .unwrap()
+            .unwrap()
+            .id,
+        second.id
+    );
+    assert_eq!(
+        store
+            .find_client_session("/other", "fish-one")
+            .unwrap()
+            .unwrap()
+            .id,
+        other_cwd.id
+    );
+}
+
+#[test]
+fn turn_interruption_is_model_context_but_not_a_rewind_checkpoint() {
+    let mut store = SessionStore::open_in_memory().unwrap();
+    let session = store
+        .create_session(NewSession::new("/repo", "responses", "model"))
+        .unwrap();
+    store
+        .append_item(
+            &session.id,
+            Role::User,
+            vec![ContentBlock::Text("long task".into())],
+        )
+        .unwrap();
+    store.append_turn_interrupted(&session.id).unwrap();
+
+    let branch = store.active_branch(&session.id).unwrap();
+    assert!(
+        branch.iter().any(|item| {
+            item.blocks == vec![ContentBlock::Text(TURN_INTERRUPTED_NOTICE.into())]
+        })
+    );
+    assert_eq!(store.user_checkpoints(&session.id).unwrap().len(), 1);
 }
 
 #[test]
@@ -99,6 +170,7 @@ fn shell_history_is_bounded_and_cwd_scoped() {
         store
             .record_shell_history(
                 "/repo",
+                None,
                 &format!("cmd {index}"),
                 Some(index),
                 index as i64,
@@ -107,7 +179,7 @@ fn shell_history_is_bounded_and_cwd_scoped() {
             )
             .unwrap();
     }
-    let recent = store.recent_shell_history("/repo", 2).unwrap();
+    let recent = store.recent_shell_history("/repo", None, 2).unwrap();
     assert_eq!(
         recent
             .iter()
@@ -117,6 +189,75 @@ fn shell_history_is_bounded_and_cwd_scoped() {
     );
     store.prune_shell_history(3).unwrap();
     assert_eq!(store.shell_history_count().unwrap(), 3);
+}
+
+#[test]
+fn shell_history_can_be_scoped_to_one_fish_session() {
+    let store = SessionStore::open_in_memory().unwrap();
+    for (key, command, timestamp) in [
+        ("fish-one", "cargo test", 1),
+        ("fish-two", "git status", 2),
+        ("fish-one", "cargo clippy", 3),
+    ] {
+        store
+            .record_shell_history(
+                "/repo",
+                Some(key),
+                command,
+                Some(0),
+                timestamp,
+                Some(10),
+                None,
+            )
+            .unwrap();
+    }
+    let first = store
+        .recent_shell_history("/repo", Some("fish-one"), 5)
+        .unwrap();
+    assert_eq!(
+        first
+            .iter()
+            .map(|item| item.command.as_str())
+            .collect::<Vec<_>>(),
+        ["cargo clippy", "cargo test"]
+    );
+}
+
+#[test]
+fn opening_a_v1_database_adds_client_session_columns() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("sessions.db");
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE sessions (
+                id TEXT PRIMARY KEY, cwd TEXT NOT NULL, title TEXT, head_item_id TEXT,
+                provider_type TEXT NOT NULL, model TEXT NOT NULL,
+                created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+             );
+             CREATE TABLE shell_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, cwd TEXT NOT NULL, command TEXT NOT NULL,
+                exit_code INTEGER, pipe_status TEXT, started_at INTEGER NOT NULL, duration_ms INTEGER
+             );
+             PRAGMA user_version = 1;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let mut store = SessionStore::open(&path).unwrap();
+    let session = store
+        .create_session(
+            NewSession::new("/repo", "responses", "model").with_client_session_key("fish-one"),
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .find_client_session("/repo", "fish-one")
+            .unwrap()
+            .unwrap()
+            .id,
+        session.id
+    );
 }
 
 struct SequenceProvider {
