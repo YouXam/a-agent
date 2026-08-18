@@ -318,6 +318,7 @@ pub struct InputEditor {
     pending_initial: Option<(String, String)>,
     reasoning_key: char,
     multi: Arc<AtomicBool>,
+    palette: Arc<PaletteState>,
 }
 
 impl InputEditor {
@@ -381,7 +382,7 @@ impl InputEditor {
         editor.bind_sequence(
             KeyEvent(KeyCode::Down, Modifiers::NONE),
             EventHandler::Conditional(Box::new(PaletteNavigation {
-                palette,
+                palette: palette.clone(),
                 direction: 1,
             })),
         );
@@ -392,6 +393,7 @@ impl InputEditor {
             pending_initial: None,
             reasoning_key,
             multi,
+            palette,
         })
     }
 
@@ -417,6 +419,7 @@ impl InputEditor {
         };
         match result {
             Ok(line) => {
+                let line = self.accept_palette_selection(line);
                 if !line.trim().is_empty() {
                     self.editor
                         .add_history_entry(line.as_str())
@@ -441,6 +444,17 @@ impl InputEditor {
             Err(ReadlineError::Eof) => Ok(InputAction::Eof),
             Err(error) => Err(io::Error::other(error)),
         }
+    }
+
+    fn accept_palette_selection(&self, line: String) -> String {
+        let Some(prefix) = command_prefix(&line, line.len()) else {
+            return line;
+        };
+        let commands = matching_commands(prefix);
+        let selected = self.palette.selected(prefix, commands.len());
+        commands
+            .get(selected)
+            .map_or(line, |command| command.name.into())
     }
 
     pub fn add_history_entries(&mut self, entries: &[String]) -> io::Result<()> {

@@ -664,6 +664,12 @@ async fn interactive_tui_is_inline_aligned_and_does_not_duplicate_input() {
         commands.contains("/resume [session-id]") && commands.contains("Resume a session"),
         "{commands:?}"
     );
+    tmux_send_key(&socket, session, "Enter").await;
+    wait_for_tmux_text(&socket, session, "Model:").await;
+    tmux_send_key(&socket, session, "Escape").await;
+    wait_for_agent_prompt(&socket, session).await;
+    tmux_send_text(&socket, session, "/").await;
+    wait_for_tmux_text(&socket, session, "› /model [profile]").await;
     tmux_send_key(&socket, session, "Down").await;
     let selected_effort = wait_for_tmux_text(&socket, session, "› /effort [level]").await;
     assert!(

@@ -152,8 +152,9 @@ Interactive commands:
 
 Without an argument, `/model` and `/effort` open an arrow-key selector. Typing
 `/` opens a live-filtered command palette below the input. Use `Up`/`Down` to
-select a command and `Tab` to accept it. Each row shows the command's parameters
-and purpose. `/thinking` toggles reasoning visibility, like `Ctrl+O`, and
+select a command, then `Tab` to complete it or `Enter` to run it immediately.
+Each row shows the command's parameters and purpose. `/thinking` toggles
+reasoning visibility, like `Ctrl+O`, and
 reports the new state. Model profile and effort changes are persisted with the
 session and restored by resume. `/resume` opens a current-directory session
 selector when no ID is given. In Fish, selecting a session also rebinds that
