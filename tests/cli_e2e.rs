@@ -343,7 +343,7 @@ api_key = "secret"
         "{}",
         String::from_utf8_lossy(&started.stderr)
     );
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    wait_for_agent_prompt(&socket, session).await;
     assert!(
         Command::new("tmux")
             .args(["-L", &socket, "send-keys", "-t", session, "-l", "hi"])
@@ -894,6 +894,25 @@ async fn wait_for_fish_prompt(socket: &str, session: &str) {
     }
     panic!(
         "Fish prompt did not appear: {:?}",
+        tmux_pane(socket, session).await
+    );
+}
+
+async fn wait_for_agent_prompt(socket: &str, session: &str) {
+    for _ in 0..120 {
+        let pane = tmux_pane(socket, session).await;
+        if pane
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .is_some_and(|line| matches!(line.trim(), ">" | "›"))
+        {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!(
+        "agent prompt did not appear: {:?}",
         tmux_pane(socket, session).await
     );
 }
