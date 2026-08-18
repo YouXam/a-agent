@@ -45,6 +45,10 @@ fn sessions_resume_by_cwd_and_reconstruct_active_branch() {
             .collect::<Vec<_>>(),
         [user.id, assistant.id]
     );
+    assert_eq!(
+        store.first_user_prompt(&session.id).unwrap().as_deref(),
+        Some("hello")
+    );
 }
 
 #[test]
@@ -163,6 +167,20 @@ fn recent_sessions_can_rebind_the_current_fish_key() {
         .unwrap();
     store
         .create_session(NewSession::new("/other", "responses", "other"))
+        .unwrap();
+    store
+        .append_item(
+            &original.id,
+            Role::User,
+            vec![ContentBlock::Text("first session".into())],
+        )
+        .unwrap();
+    store
+        .append_item(
+            &target.id,
+            Role::User,
+            vec![ContentBlock::Text("target session".into())],
+        )
         .unwrap();
 
     let recent = store.recent_sessions("/repo", 10).unwrap();
@@ -614,6 +632,54 @@ async fn auto_compaction_does_not_reestimate_history_before_a_valid_usage_anchor
             .iter()
             .any(|block| matches!(block, ContentBlock::Text(text) if text.len() == 10_000))
     }));
+}
+
+#[test]
+fn context_status_combines_provider_usage_with_trailing_estimates() {
+    let tools = Arc::new(ToolRunner::new(Arc::new(FakeTools), 8));
+    let store = Arc::new(Mutex::new(SessionStore::open_in_memory().unwrap()));
+    let session = store
+        .lock()
+        .unwrap()
+        .create_session(NewSession::new("/repo", "responses", "model"))
+        .unwrap();
+    store
+        .lock()
+        .unwrap()
+        .append_assistant_item(
+            &session.id,
+            vec![ContentBlock::Text("anchor".into())],
+            Some(Usage {
+                total_tokens: Some(100),
+                ..Usage::default()
+            }),
+        )
+        .unwrap();
+    store
+        .lock()
+        .unwrap()
+        .append_item(
+            &session.id,
+            Role::Tool,
+            vec![ContentBlock::ToolResult(ToolResult::success(
+                "call",
+                "x".repeat(40),
+            ))],
+        )
+        .unwrap();
+    let provider = Arc::new(SequenceProvider {
+        turns: Mutex::new(Vec::new()),
+        request_count: AtomicCounter::default(),
+    });
+    let agent = Agent::new(provider, tools, store, session.id, "system".into(), 10)
+        .with_context_budget(Some(1000), 100);
+
+    let status = agent.context_status().unwrap();
+    assert_eq!(status.used_tokens, 110);
+    assert_eq!(status.provider_tokens, Some(100));
+    assert_eq!(status.estimated_tokens, 10);
+    assert_eq!(status.context_window, Some(1000));
+    assert_eq!(status.compact_at, Some(900));
 }
 
 #[tokio::test]

@@ -209,11 +209,32 @@ impl SessionStore {
 
     pub fn recent_sessions(&self, cwd: &str, limit: usize) -> Result<Vec<Session>> {
         let mut statement = self.connection.prepare(
-            "SELECT id, cwd, title, head_item_id, provider_type, model, model_profile, effort, created_at, updated_at FROM sessions WHERE cwd = ?1 ORDER BY updated_at DESC, rowid DESC LIMIT ?2",
+            "SELECT id, cwd, title, head_item_id, provider_type, model, model_profile, effort, created_at, updated_at FROM sessions WHERE cwd = ?1 AND EXISTS (SELECT 1 FROM conversation_items WHERE conversation_items.session_id = sessions.id AND conversation_items.kind = 'user_message') ORDER BY updated_at DESC, rowid DESC LIMIT ?2",
         )?;
         let rows = statement.query_map(params![cwd, limit], row_to_session)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
+    }
+
+    pub fn first_user_prompt(&self, session_id: &str) -> Result<Option<String>> {
+        let content = self
+            .connection
+            .query_row(
+                "SELECT content_json FROM conversation_items WHERE session_id = ?1 AND kind = 'user_message' ORDER BY created_at ASC, rowid ASC LIMIT 1",
+                [session_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        content
+            .map(|content| {
+                let blocks: Vec<ContentBlock> = serde_json::from_str(&content)?;
+                Ok(blocks.into_iter().find_map(|block| match block {
+                    ContentBlock::Text(text) => Some(text),
+                    _ => None,
+                }))
+            })
+            .transpose()
+            .map(Option::flatten)
     }
 
     pub fn rebind_client_session_key(

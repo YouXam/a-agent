@@ -3,7 +3,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::sync::{Arc, Mutex};
 
 use a_agent::fish::{fish_script, install_to};
-use a_agent::model::{StreamEvent, ToolResult};
+use a_agent::model::{ContentBlock, ConversationItem, Role, StreamEvent, ToolCall, ToolResult};
 use a_agent::tui::{InlineRenderer, InputEditor, RenderLimits};
 use crossterm::event::{KeyCode, KeyModifiers};
 use tokio::process::Command;
@@ -85,6 +85,63 @@ fn transcript_is_append_only_aligned_and_colored() {
                 .any(|window| window == forbidden)
         );
     }
+}
+
+#[test]
+fn resumed_history_replays_tool_calls_and_results() {
+    let writer = SharedWriter::default();
+    let renderer = InlineRenderer::new(writer.clone(), false, false);
+    let item = |id: &str, parent_id: Option<&str>, role, blocks| ConversationItem {
+        id: id.into(),
+        session_id: "session".into(),
+        parent_id: parent_id.map(str::to_owned),
+        role,
+        blocks,
+        usage: None,
+        created_at: 0,
+    };
+    let history = vec![
+        item(
+            "user",
+            None,
+            Role::User,
+            vec![ContentBlock::Text("run the check".into())],
+        ),
+        item(
+            "assistant-tool",
+            Some("user"),
+            Role::Assistant,
+            vec![ContentBlock::ToolCall(ToolCall::new(
+                "call",
+                "bash",
+                r#"{"command":"printf ok"}"#,
+            ))],
+        ),
+        item(
+            "tool",
+            Some("assistant-tool"),
+            Role::Tool,
+            vec![ContentBlock::ToolResult(ToolResult::success(
+                "call",
+                "ok\n[exit code: 0]",
+            ))],
+        ),
+        item(
+            "assistant-final",
+            Some("tool"),
+            Role::Assistant,
+            vec![ContentBlock::Text("check complete".into())],
+        ),
+    ];
+
+    renderer.render_resumed_history(&history).unwrap();
+    let plain = String::from_utf8(writer.bytes()).unwrap();
+    assert!(plain.contains("Resumed conversation"), "{plain}");
+    assert!(plain.contains("› run the check"), "{plain}");
+    assert!(plain.contains("✓ bash  exit 0"), "{plain}");
+    assert!(plain.contains("  $ printf ok"), "{plain}");
+    assert!(plain.contains("  │ ok"), "{plain}");
+    assert!(plain.contains("│ check complete"), "{plain}");
 }
 
 #[test]

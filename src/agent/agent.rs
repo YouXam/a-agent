@@ -25,6 +25,22 @@ pub struct AgentResult {
     pub cycles: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextStatus {
+    pub used_tokens: u64,
+    pub provider_tokens: Option<u64>,
+    pub estimated_tokens: u64,
+    pub context_window: Option<u64>,
+    pub compact_at: Option<u64>,
+    pub max_output_tokens: u64,
+}
+
+struct ContextEstimate {
+    total: u64,
+    provider: Option<u64>,
+    estimated: u64,
+}
+
 impl Agent {
     pub fn new(
         provider: Arc<dyn Provider>,
@@ -170,7 +186,8 @@ impl Agent {
             return Ok(());
         }
         if branch.is_empty()
-            || estimate_context_tokens(&self.system_prompt, &branch, additional_prompt) <= threshold
+            || estimate_context_tokens(&self.system_prompt, &branch, additional_prompt).total
+                <= threshold
         {
             return Ok(());
         }
@@ -228,6 +245,25 @@ impl Agent {
         Ok(true)
     }
 
+    pub fn context_status(&self) -> Result<ContextStatus> {
+        let branch = self
+            .store
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session store lock poisoned"))?
+            .active_branch(&self.session_id)?;
+        let estimate = estimate_context_tokens(&self.system_prompt, &branch, None);
+        Ok(ContextStatus {
+            used_tokens: estimate.total,
+            provider_tokens: estimate.provider,
+            estimated_tokens: estimate.estimated,
+            context_window: self.context_window,
+            compact_at: self
+                .context_window
+                .map(|window| window.saturating_sub(self.max_output_tokens)),
+            max_output_tokens: self.max_output_tokens,
+        })
+    }
+
     pub fn record_interruption(&self) -> Result<()> {
         self.store
             .lock()
@@ -255,7 +291,7 @@ fn estimate_context_tokens(
     system_prompt: &str,
     branch: &[crate::model::ConversationItem],
     additional_prompt: Option<&str>,
-) -> u64 {
+) -> ContextEstimate {
     let usage_anchor = branch.iter().enumerate().rev().find_map(|(index, item)| {
         (item.role == Role::Assistant)
             .then_some(item.usage)
@@ -264,24 +300,29 @@ fn estimate_context_tokens(
             .filter(|tokens| *tokens > 0)
             .map(|tokens| (index, tokens))
     });
-    let (start, mut tokens) = usage_anchor.map_or_else(
+    let (start, provider, mut estimated) = usage_anchor.map_or_else(
         || {
             let tools =
                 serde_json::to_string(&crate::provider::tool_definitions()).unwrap_or_default();
             (
                 0,
+                None,
                 estimate_text_tokens(system_prompt) + estimate_text_tokens(&tools),
             )
         },
-        |(index, tokens)| (index + 1, tokens),
+        |(index, tokens)| (index + 1, Some(tokens), 0),
     );
     for item in &branch[start..] {
-        tokens += estimate_blocks_tokens(&item.blocks);
+        estimated += estimate_blocks_tokens(&item.blocks);
     }
     if let Some(prompt) = additional_prompt {
-        tokens += estimate_text_tokens(prompt);
+        estimated += estimate_text_tokens(prompt);
     }
-    tokens
+    ContextEstimate {
+        total: provider.unwrap_or(0) + estimated,
+        provider,
+        estimated,
+    }
 }
 
 fn estimate_blocks_tokens(blocks: &[ContentBlock]) -> u64 {

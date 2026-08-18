@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use a_agent::fish::install_to;
+use a_agent::model::{ContentBlock, Role};
 use a_agent::session::{SessionStore, TURN_INTERRUPTED_NOTICE};
 use tempfile::tempdir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -91,6 +92,36 @@ async fn one_turn_cli_persists_and_resumes_without_eager_file_content() {
         "{}",
         String::from_utf8_lossy(&second.stderr)
     );
+    let resumed_output = String::from_utf8_lossy(&second.stdout);
+    assert!(
+        resumed_output.contains("Resumed conversation"),
+        "{resumed_output}"
+    );
+    assert!(
+        resumed_output.contains("answer briefly"),
+        "{resumed_output}"
+    );
+    assert!(
+        resumed_output.contains("hello from model"),
+        "{resumed_output}"
+    );
+
+    let status = Command::new(binary)
+        .args(["-r", "-1", "/status"])
+        .current_dir(&repo)
+        .env("HOME", &home)
+        .env("XDG_STATE_HOME", &state)
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let status_output = String::from_utf8_lossy(&status.stdout);
+    assert!(status_output.contains("context"), "{status_output}");
+    assert!(status_output.contains("tokens"), "{status_output}");
 
     let requests = server.received_requests().await.unwrap();
     assert_eq!(requests.len(), 2);
@@ -101,6 +132,53 @@ async fn one_turn_cli_persists_and_resumes_without_eager_file_content() {
     let second_body = String::from_utf8(requests[1].body.clone()).unwrap();
     assert!(second_body.contains("hello from model"));
     assert!(second_body.contains("continue"));
+}
+
+#[tokio::test]
+async fn explicit_session_resume_rejects_a_different_cwd() {
+    let temp = tempdir().unwrap();
+    let home = temp.path().join("home");
+    let repo = temp.path().join("repo");
+    let other = temp.path().join("other");
+    let state = temp.path().join("state");
+    fs::create_dir_all(home.join(".config/a")).unwrap();
+    fs::create_dir_all(&repo).unwrap();
+    fs::create_dir_all(&other).unwrap();
+    fs::write(
+        home.join(".config/a/config.toml"),
+        r#"
+default_model = "test"
+[providers.test]
+type = "responses"
+api_key = "secret"
+[models.test]
+provider = "test"
+model = "test-model"
+"#,
+    )
+    .unwrap();
+    let session = SessionStore::open(&state.join("a/sessions.db"))
+        .unwrap()
+        .create_session(
+            a_agent::session::NewSession::new(other.to_str().unwrap(), "responses", "test-model")
+                .with_model_selection("test", None),
+        )
+        .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_a"))
+        .args(["--session", &session.id, "-1", "/status"])
+        .current_dir(&repo)
+        .env("HOME", &home)
+        .env("XDG_STATE_HOME", &state)
+        .output()
+        .await
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("different cwd"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[tokio::test]
@@ -330,6 +408,102 @@ model = "test-model"
             .id,
         target_id
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn resume_selector_lists_first_user_prompts() {
+    if Command::new("tmux").arg("-V").output().await.is_err() {
+        return;
+    }
+    let temp = tempdir().unwrap();
+    let home = temp.path().join("home");
+    let repo = temp.path().join("repo");
+    let state = temp.path().join("state");
+    fs::create_dir_all(home.join(".config/a")).unwrap();
+    fs::create_dir_all(&repo).unwrap();
+    fs::write(
+        home.join(".config/a/config.toml"),
+        r#"
+default_model = "test"
+[providers.test]
+type = "responses"
+api_key = "secret"
+[models.test]
+provider = "test"
+model = "test-model"
+"#,
+    )
+    .unwrap();
+    {
+        let mut store = SessionStore::open(&state.join("a/sessions.db")).unwrap();
+        for prompt in ["fix the parser lifetime", "investigate the build failure"] {
+            let session = store
+                .create_session(
+                    a_agent::session::NewSession::new(
+                        repo.to_str().unwrap(),
+                        "responses",
+                        "test-model",
+                    )
+                    .with_model_selection("test", None),
+                )
+                .unwrap();
+            store
+                .append_item(
+                    &session.id,
+                    Role::User,
+                    vec![ContentBlock::Text(prompt.into())],
+                )
+                .unwrap();
+        }
+    }
+
+    let socket = format!("a-resume-select-{}", std::process::id());
+    let session = "resume-select";
+    let shell = format!(
+        "env HOME={} XDG_STATE_HOME={} bash --noprofile --norc",
+        home.display(),
+        state.display()
+    );
+    assert!(
+        Command::new("tmux")
+            .args([
+                "-L",
+                &socket,
+                "new-session",
+                "-d",
+                "-x",
+                "100",
+                "-y",
+                "24",
+                "-s",
+                session,
+                "-c",
+                repo.to_str().unwrap(),
+                &shell,
+            ])
+            .status()
+            .await
+            .unwrap()
+            .success()
+    );
+    tmux_send_text(
+        &socket,
+        session,
+        &format!("{} -1 /resume", env!("CARGO_BIN_EXE_a")),
+    )
+    .await;
+    tmux_send_key(&socket, session, "Enter").await;
+    let pane = wait_for_tmux_text(&socket, session, "investigate the build failure").await;
+    assert!(pane.contains("fix the parser lifetime"), "{pane:?}");
+    assert!(!pane.contains("a_"), "{pane:?}");
+
+    tmux_send_key(&socket, session, "Escape").await;
+    wait_for_pane_command(&socket, session, "bash").await;
+    let _ = Command::new("tmux")
+        .args(["-L", &socket, "kill-server"])
+        .status()
+        .await;
 }
 
 #[tokio::test]
@@ -754,8 +928,8 @@ async fn interactive_tui_is_inline_aligned_and_does_not_duplicate_input() {
     wait_for_tmux_text(&socket, session, "reasoning: collapsed").await;
 
     tmux_send_key(&socket, session, "Escape").await;
-    let single_escape = wait_for_tmux_text(&socket, session, "Rewind to:").await;
-    assert!(single_escape.contains("rewind>"), "{single_escape:?}");
+    let single_escape = wait_for_tmux_text(&socket, session, "rewind>").await;
+    assert!(single_escape.contains("Rewind to:"), "{single_escape:?}");
     tmux_send_key(&socket, session, "C-c").await;
     wait_for_agent_prompt(&socket, session).await;
     tmux_send_text(&socket, session, "retained").await;

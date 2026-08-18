@@ -157,10 +157,18 @@ Each row shows the command's parameters and purpose. `/thinking` toggles
 reasoning visibility, like `Ctrl+O`, and
 reports the new state. Model profile and effort changes are persisted with the
 session and restored by resume. `/resume` opens a current-directory session
-selector when no ID is given. In Fish, selecting a session also rebinds that
-Fish process so later `Ctrl+G` turns continue the selected conversation.
+selector when no ID is given; entries are labeled with their first user prompt.
+Resuming a session prints a divider and replays its active history before new
+input. Sessions from another cwd are rejected. In Fish, selecting a session
+also rebinds that Fish process so later `Ctrl+G` turns continue the selected
+conversation.
 `/compact` immediately summarizes the active branch; automatic compaction uses
 the same path.
+
+`/status` reports the active model and effort plus context usage. It
+distinguishes the latest provider-reported token anchor from locally estimated
+trailing messages, and shows the context window and automatic-compaction
+threshold when configured.
 
 When a model profile sets `context_window`, automatic compaction triggers near
 `context_window - max_tokens`. Context usage is anchored to the latest valid

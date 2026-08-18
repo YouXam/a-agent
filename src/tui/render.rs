@@ -11,7 +11,7 @@ use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use serde_json::Value;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::model::{StreamEvent, ToolResult};
+use crate::model::{ContentBlock, ConversationItem, Role, StreamEvent, ToolResult};
 use crate::provider::EventSink;
 
 const GENERATION_ID: &str = "__a_generation";
@@ -208,6 +208,82 @@ impl InlineRenderer {
             }
             state.writer.flush()
         })
+    }
+
+    pub fn render_resumed_history(&self, items: &[ConversationItem]) -> io::Result<()> {
+        self.begin_turn()?;
+        self.with_state(|state| {
+            write_styled(
+                &mut state.writer,
+                state.color,
+                "──────── Resumed conversation ────────\n",
+                Color::DarkGrey,
+                true,
+            )?;
+            state.writer.flush()
+        })?;
+        for item in items {
+            match item.role {
+                Role::User => {
+                    let text = item
+                        .blocks
+                        .iter()
+                        .filter_map(|block| match block {
+                            ContentBlock::Text(text) => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if !text.is_empty() {
+                        self.render_user(&text)?;
+                    }
+                }
+                Role::Assistant => {
+                    self.begin_turn()?;
+                    for block in &item.blocks {
+                        match block {
+                            ContentBlock::Reasoning(delta) => {
+                                self.render_event(StreamEvent::ReasoningDelta {
+                                    delta: delta.clone(),
+                                })?
+                            }
+                            ContentBlock::Text(delta) => {
+                                self.render_event(StreamEvent::TextDelta {
+                                    delta: delta.clone(),
+                                })?
+                            }
+                            ContentBlock::ToolCall(call) => {
+                                self.render_event(StreamEvent::ToolCallStart {
+                                    id: call.id.clone(),
+                                    name: call.name.clone(),
+                                })?;
+                                self.render_event(StreamEvent::ToolCallArgsDelta {
+                                    id: call.id.clone(),
+                                    delta: call.arguments.clone(),
+                                })?;
+                                self.render_event(StreamEvent::ToolCallEnd {
+                                    id: call.id.clone(),
+                                })?;
+                            }
+                            ContentBlock::ToolResult(_) => {}
+                        }
+                    }
+                    self.render_event(StreamEvent::Done)?;
+                }
+                Role::Tool => {
+                    for block in &item.blocks {
+                        if let ContentBlock::ToolResult(result) = block {
+                            self.render_event(StreamEvent::ToolExecutionEnd {
+                                id: result.call_id.clone(),
+                                result: result.clone(),
+                            })?;
+                        }
+                    }
+                }
+                Role::System => {}
+            }
+        }
+        Ok(())
     }
 
     pub fn event_sink(&self) -> EventSink {

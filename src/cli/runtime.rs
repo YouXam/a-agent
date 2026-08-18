@@ -9,7 +9,7 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use futures_util::StreamExt;
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::Agent;
+use crate::agent::{Agent, ContextStatus};
 use crate::config::{Config, ModelSelection};
 use crate::context::{
     ContextInput, build_system_prompt, discover_agents_for_targets, discover_skills,
@@ -153,6 +153,9 @@ pub async fn run() -> Result<i32> {
             .recent_input_history(config.session.input_history_limit)?;
         input.add_history_entries(&history)?;
     }
+    if args.resume {
+        render_session_history(&renderer, &store, &session.id)?;
+    }
     timing.mark("request_build");
     timing.print();
 
@@ -192,7 +195,10 @@ pub async fn run() -> Result<i32> {
                     &system_prompt,
                     config.session.max_agent_cycles,
                 )?;
-                renderer.render_status(&format!("resumed session {}", session.id))?;
+                render_session_history(&renderer, &store, &session.id)?;
+            }
+            SlashAction::Status => {
+                render_agent_status(&renderer, &session, &selection, &agent)?;
             }
             SlashAction::Handled => {}
             SlashAction::NotCommand => {
@@ -264,7 +270,10 @@ pub async fn run() -> Result<i32> {
                             &system_prompt,
                             config.session.max_agent_cycles,
                         )?;
-                        renderer.render_status(&format!("resumed session {}", session.id))?;
+                        render_session_history(&renderer, &store, &session.id)?;
+                    }
+                    SlashAction::Status => {
+                        render_agent_status(&renderer, &session, &selection, &agent)?;
                     }
                     SlashAction::Handled => {}
                     SlashAction::NotCommand => {
@@ -467,9 +476,13 @@ fn resolve_session(
     default_selection: &ModelSelection,
 ) -> Result<crate::session::Session> {
     if let Some(id) = &args.resume_session_id {
-        return store
+        let session = store
             .get_session(id)?
-            .with_context(|| format!("session not found: {id}"));
+            .with_context(|| format!("session not found: {id}"))?;
+        if session.cwd != cwd {
+            anyhow::bail!("cannot resume a session from a different cwd");
+        }
+        return Ok(session);
     }
     if args.resume
         && let Some(session) = store.find_latest_session(cwd)?
@@ -567,6 +580,100 @@ fn resume_session(
     Ok(())
 }
 
+fn render_session_history(
+    renderer: &InlineRenderer,
+    store: &Arc<Mutex<SessionStore>>,
+    session_id: &str,
+) -> Result<()> {
+    let branch = store
+        .lock()
+        .map_err(|_| anyhow::anyhow!("session store lock poisoned"))?
+        .active_branch(session_id)?;
+    if !branch.is_empty() {
+        renderer.render_resumed_history(&branch)?;
+    }
+    Ok(())
+}
+
+fn render_context_status(renderer: &InlineRenderer, status: ContextStatus) -> Result<()> {
+    let source = status.provider_tokens.map_or_else(
+        || format!("estimated {}", format_tokens(status.estimated_tokens)),
+        |provider| {
+            format!(
+                "API {} + estimated {}",
+                format_tokens(provider),
+                format_tokens(status.estimated_tokens)
+            )
+        },
+    );
+    if let (Some(window), Some(compact_at)) = (status.context_window, status.compact_at) {
+        let percentage = if window == 0 {
+            0
+        } else {
+            (u128::from(status.used_tokens) * 100 / u128::from(window)) as u64
+        };
+        renderer.render_status(&format!(
+            "context {} / {} tokens ({percentage}%) · {source}",
+            format_tokens(status.used_tokens),
+            format_tokens(window)
+        ))?;
+        renderer.render_status(&format!(
+            "compact at {} · {} tokens remaining · max output {}",
+            format_tokens(compact_at),
+            format_tokens(compact_at.saturating_sub(status.used_tokens)),
+            format_tokens(status.max_output_tokens)
+        ))?;
+    } else {
+        renderer.render_status(&format!(
+            "context {} tokens · {source} · context window not configured",
+            format_tokens(status.used_tokens)
+        ))?;
+    }
+    Ok(())
+}
+
+fn render_agent_status(
+    renderer: &InlineRenderer,
+    session: &crate::session::Session,
+    selection: &ModelSelection,
+    agent: &Agent,
+) -> Result<()> {
+    renderer.render_status(&format!(
+        "session {} · model {} · {} · effort {}",
+        session.id,
+        selection.name,
+        selection.provider.model,
+        selection.effort.as_deref().unwrap_or("default")
+    ))?;
+    render_context_status(renderer, agent.context_status()?)
+}
+
+fn format_tokens(value: u64) -> String {
+    let digits = value.to_string();
+    let mut output = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, character) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            output.push(',');
+        }
+        output.push(character);
+    }
+    output
+}
+
+fn session_preview(text: &str) -> String {
+    let text = text
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or(text);
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut preview = compact.chars().take(64).collect::<String>();
+    if compact.chars().count() > 64 {
+        preview.push('…');
+    }
+    preview
+}
+
 fn toggle_reasoning(renderer: &InlineRenderer) -> Result<()> {
     let visible = renderer.toggle_reasoning()?;
     renderer.render_status(if visible {
@@ -650,16 +757,7 @@ fn handle_slash_command(
             renderer.render_status(&format!("effort: {effort}"))?;
             Ok(SlashAction::SwitchModel(selected))
         }
-        "/status" => {
-            renderer.render_status(&format!(
-                "session {} · model {} · {} · effort {}",
-                session.id,
-                selection.name,
-                selection.provider.model,
-                selection.effort.as_deref().unwrap_or("default")
-            ))?;
-            Ok(SlashAction::Handled)
-        }
+        "/status" => Ok(SlashAction::Status),
         "/clear" => {
             store
                 .lock()
@@ -681,21 +779,43 @@ fn handle_slash_command(
                     .get_session(id)?
                     .with_context(|| format!("session not found: {id}"))?
             } else {
-                let sessions = store
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("session store lock poisoned"))?
-                    .recent_sessions(&session.cwd, 20)?;
-                let labels = sessions
-                    .iter()
-                    .map(|candidate| {
-                        format!(
-                            "{}  {} · {}",
-                            candidate.id,
-                            candidate.model_profile.as_deref().unwrap_or("unconfigured"),
-                            candidate.model
-                        )
-                    })
-                    .collect::<Vec<_>>();
+                let (sessions, labels) = {
+                    let store = store
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("session store lock poisoned"))?;
+                    let sessions = store.recent_sessions(&session.cwd, 20)?;
+                    let labels = sessions
+                        .iter()
+                        .map(|candidate| {
+                            let preview = store
+                                .first_user_prompt(&candidate.id)?
+                                .map(|prompt| session_preview(&prompt))
+                                .filter(|preview| !preview.is_empty())
+                                .unwrap_or_else(|| "(empty session)".into());
+                            let short_id = candidate
+                                .id
+                                .chars()
+                                .rev()
+                                .take(8)
+                                .collect::<String>()
+                                .chars()
+                                .rev()
+                                .collect::<String>();
+                            Ok(format!(
+                                "{preview}  · {} · …{short_id}",
+                                candidate
+                                    .model_profile
+                                    .as_deref()
+                                    .unwrap_or(&candidate.model)
+                            ))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    (sessions, labels)
+                };
+                if sessions.is_empty() {
+                    renderer.render_status("no resumable sessions in the current cwd")?;
+                    return Ok(SlashAction::Handled);
+                }
                 let default = sessions
                     .iter()
                     .position(|candidate| candidate.id == session.id)
@@ -729,6 +849,7 @@ enum SlashAction {
     SwitchModel(ModelSelection),
     Compact,
     Resume(crate::session::Session),
+    Status,
 }
 
 fn resolve_targets(cwd: &Path, files: &[String]) -> Result<Vec<PathBuf>> {
