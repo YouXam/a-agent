@@ -288,6 +288,44 @@ fn bash_without_output_renders_one_italic_placeholder_without_metadata() {
 }
 
 #[test]
+fn multiline_bash_uses_one_primary_prompt_and_continuation_prompts() {
+    let writer = SharedWriter::default();
+    let renderer = InlineRenderer::new(writer.clone(), false, false);
+    let sink = renderer.event_sink();
+    sink.emit(StreamEvent::ToolCallStart {
+        id: "multiline".into(),
+        name: "bash".into(),
+    });
+    sink.emit(StreamEvent::ToolCallArgsDelta {
+        id: "multiline".into(),
+        delta: serde_json::json!({
+            "command": "cat <<'EOF'\nfirst line\nsecond line\nEOF"
+        })
+        .to_string(),
+    });
+    sink.emit(StreamEvent::ToolCallEnd {
+        id: "multiline".into(),
+    });
+    sink.emit(StreamEvent::ToolExecutionEnd {
+        id: "multiline".into(),
+        result: ToolResult::success("multiline", "\n[exit code: 0]"),
+    });
+
+    let plain = String::from_utf8(writer.bytes()).unwrap();
+    assert_eq!(
+        plain
+            .lines()
+            .filter(|line| line.starts_with("  $ "))
+            .count(),
+        1
+    );
+    assert!(plain.contains("  $ cat <<'EOF'"), "{plain}");
+    assert!(plain.contains("  > first line"), "{plain}");
+    assert!(plain.contains("  > second line"), "{plain}");
+    assert!(plain.contains("  > EOF"), "{plain}");
+}
+
+#[test]
 fn fish_script_has_metadata_hooks_dedicated_ai_read_and_mode_bindings() {
     let script = fish_script();
     assert!(script.contains("--on-event fish_preexec"));

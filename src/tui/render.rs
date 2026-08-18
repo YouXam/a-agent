@@ -766,8 +766,8 @@ impl LiveTools {
         self.terminal_width = usize::from(terminal_width).max(1);
         let available_rows = usize::from(terminal_height.saturating_sub(1));
         let rows_per_tool = available_rows / tool_count.max(1);
-        self.visible_lines = self.max_lines.min(rows_per_tool.saturating_sub(1));
-        let desired = tool_count.saturating_mul(self.visible_lines.saturating_add(1));
+        self.visible_lines = self.max_lines.min(rows_per_tool.saturating_sub(2));
+        let desired = tool_count.saturating_mul(self.visible_lines.saturating_add(2));
         let height = desired.min(available_rows) as u16;
         self.reserve_rows(height);
     }
@@ -987,16 +987,17 @@ fn live_tool_message(
     terminal_width: usize,
     color_enabled: bool,
 ) -> String {
-    let is_bash = tool.name == "bash";
+    let mut bash_command = None;
     let label = match tool.name.as_str() {
         "bash" => {
             let command = format_tool_input("bash", &tool.arguments.text);
             let mut lines = command.lines();
             let first_line = lines.next().unwrap_or_default();
-            format!(
-                "bash  $ {first_line}{}",
+            bash_command = Some(format!(
+                "{first_line}{}",
                 if lines.next().is_some() { "…" } else { "" }
-            )
+            ));
+            "bash".into()
         }
         "read" => format!("read  {}", read_detail(&tool.arguments.text)),
         "apply_patch" => {
@@ -1009,15 +1010,23 @@ fn live_tool_message(
         name => name.to_owned(),
     };
     let label = clean_terminal_line(&label);
-    let mut label = truncate_display_width(&label, terminal_width.saturating_sub(2));
-    if is_bash && color_enabled {
-        label = label.replacen('$', "\x1b[1;36m$\x1b[0m", 1);
+    let label = truncate_display_width(&label, terminal_width.saturating_sub(2));
+    let mut message = label;
+    if let Some(command) = bash_command {
+        let command = clean_terminal_line(&command);
+        let command = truncate_display_width(&command, terminal_width.saturating_sub(4));
+        message.push('\n');
+        if color_enabled {
+            message.push_str("  \x1b[1;36m$\x1b[0m ");
+        } else {
+            message.push_str("  $ ");
+        }
+        message.push_str(&command);
     }
     let output = tool.output.limited(max_lines);
     if max_lines == 0 {
-        return label;
+        return message;
     }
-    let mut message = label;
     for (index, line) in output.lines.into_iter().enumerate() {
         let prefix = if output.truncated && index == 0 {
             "  … "
@@ -1293,8 +1302,9 @@ fn render_bash_command(
     content: &LimitedText,
     truncated: bool,
 ) -> io::Result<()> {
-    for line in &content.lines {
-        write_styled(writer, color_enabled, "  $ ", Color::Cyan, true)?;
+    for (index, line) in content.lines.iter().enumerate() {
+        let prompt = if index == 0 { "  $ " } else { "  > " };
+        write_styled(writer, color_enabled, prompt, Color::Cyan, true)?;
         write_styled(
             writer,
             color_enabled,
@@ -1544,7 +1554,7 @@ mod tests {
         read.arguments.push(r#"{"path":"src/lib.rs"}"#);
         live.start("read", live_tool_message(&read, 2, 100, false));
         let contents = terminal.contents();
-        assert!(contents.contains("bash  $ cargo test"), "{contents}");
+        assert!(contents.contains("  $ cargo test"), "{contents}");
         assert!(contents.contains("read  src/lib.rs"), "{contents}");
         assert!(contents.contains("line 4"), "{contents}");
         assert!(contents.contains("line 5"), "{contents}");
@@ -1553,7 +1563,7 @@ mod tests {
         live.finish("bash");
         live.update("read", live_tool_message(&read, 2, 100, false));
         let contents = terminal.contents();
-        assert!(!contents.contains("bash  $ cargo test"), "{contents}");
+        assert!(!contents.contains("  $ cargo test"), "{contents}");
         assert!(contents.contains("read  src/lib.rs"), "{contents}");
     }
 
@@ -1575,11 +1585,11 @@ mod tests {
         let positions = contents
             .lines()
             .enumerate()
-            .filter_map(|(index, line)| line.contains("bash  $ sleep 20").then_some(index))
+            .filter_map(|(index, line)| line.contains("  $ sleep 20").then_some(index))
             .collect::<Vec<_>>();
         assert_eq!(positions.len(), 3, "{contents}");
-        assert_eq!(positions[1] - positions[0], 1, "{contents}");
-        assert_eq!(positions[2] - positions[1], 1, "{contents}");
+        assert_eq!(positions[1] - positions[0], 2, "{contents}");
+        assert_eq!(positions[2] - positions[1], 2, "{contents}");
     }
 
     #[test]
@@ -1592,7 +1602,7 @@ mod tests {
 
         let message = live_tool_message(&bash, 2, 40, false);
         let lines = message.lines().collect::<Vec<_>>();
-        assert_eq!(lines.len(), 3, "{message:?}");
+        assert_eq!(lines.len(), 4, "{message:?}");
         assert!(UnicodeWidthStr::width(lines[0]) <= 38, "{message:?}");
         assert!(
             lines[1..]
@@ -1609,6 +1619,11 @@ mod tests {
         let mut bash = ToolDisplay::new("bash".into(), 1024, 4096);
         bash.arguments.push(r#"{"command":"cargo test"}"#);
         let message = live_tool_message(&bash, 2, 100, true);
+        let plain = String::from_utf8(strip_ansi_escapes::strip(message.as_bytes())).unwrap();
+        assert_eq!(
+            plain.lines().collect::<Vec<_>>(),
+            ["bash", "  $ cargo test"]
+        );
         let dollar = message.find('$').unwrap();
         assert!(message[..dollar].contains("\x1b[1;36m"), "{message:?}");
     }
