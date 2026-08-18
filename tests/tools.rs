@@ -190,8 +190,15 @@ async fn bash_cancellation_terminates_the_process_group() {
     let temp = tempdir().unwrap();
     let cancel = CancellationToken::new();
     let trigger = cancel.clone();
+    let pid_path = temp.path().join("child.pid");
+    let watched_pid_path = pid_path.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(80)).await;
+        for _ in 0..200 {
+            if tokio::fs::metadata(&watched_pid_path).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         trigger.cancel();
     });
     execute_bash_cancellable(
@@ -208,7 +215,7 @@ async fn bash_cancellation_terminates_the_process_group() {
     )
     .await
     .unwrap();
-    let pid = fs::read_to_string(temp.path().join("child.pid")).unwrap();
+    let pid = fs::read_to_string(pid_path).unwrap();
     tokio::time::sleep(Duration::from_millis(30)).await;
     let pid = pid.trim().parse::<i32>().unwrap();
     // SAFETY: signal 0 only checks whether the recorded child PID still exists.
