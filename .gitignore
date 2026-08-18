@@ -1,0 +1,15 @@
+/target/
+*.db
+*.db-shm
+*.db-wal
+.a/config.toml
+.env
+.env.*
+!.env.example
+.DS_Store
+*.swp
+*.swo
+*~
+coverage/
+*.profraw
+*.log

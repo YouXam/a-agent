@@ -1,0 +1,53 @@
+[provider]
+type = "responses"
+base_url = "https://api.openai.com/v1"
+model = "gpt-5.6"
+api_key_env = "OPENAI_API_KEY"
+# Optional plaintext key. When set, this takes precedence over api_key_env.
+# Warning: protect this file and never commit a real key.
+# api_key = "sk-..."
+max_tokens = 8192
+
+# OpenAI's default is used when base_url is omitted.
+# base_url = "https://api.openai.com/v1"
+
+# For an OpenAI-compatible third-party gateway, set its URL, model, and key env:
+# base_url = "https://gateway.example/v1"
+# model = "provider-model-id"
+# api_key_env = "GATEWAY_API_KEY"
+
+# To use Anthropic Messages, change the provider fields above to:
+# type = "anthropic"
+# base_url = "https://api.anthropic.com"
+# model = "your-claude-model"
+# api_key_env = "ANTHROPIC_API_KEY"
+
+# Third-party gateways can require extra headers.
+[provider.headers]
+# X-Tenant = "acme"
+
+# Extra OpenAI-compatible request fields are merged into each request.
+[provider.request]
+# service_tier = "priority"
+
+[ui]
+show_reasoning = false
+reasoning_toggle = "ctrl-o"
+tool_input_max_bytes = 2048
+tool_output_max_bytes = 8192
+tool_output_max_lines = 16
+tool_live_output_lines = 6
+
+[tools]
+bash_timeout_seconds = 120
+max_parallel = 8
+max_output_bytes = 65536
+
+[context]
+shell_history_count = 5
+stdin_max_bytes = 131072
+read_max_lines = 1000
+
+[session]
+max_agent_cycles = 50
+shell_history_limit = 5000
