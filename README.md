@@ -150,14 +150,16 @@ Interactive commands:
 /help
 ```
 
-Without an argument, `/model` and `/effort` open an arrow-key selector. Type
-`/` and press `Tab` to list commands; a unique prefix is completed in place.
-`/thinking` toggles reasoning visibility, like `Ctrl+O`, and reports the new
-state. Model profile and effort changes are persisted with the session and
-restored by resume. `/resume` opens a current-directory session selector when
-no ID is given. In Fish, selecting a session also rebinds that Fish process so later
-`Ctrl+G` turns continue the selected conversation. `/compact` immediately
-summarizes the active branch; automatic compaction uses the same path.
+Without an argument, `/model` and `/effort` open an arrow-key selector. Typing
+`/` opens a live-filtered command palette below the input. Use `Up`/`Down` to
+select a command and `Tab` to accept it. Each row shows the command's parameters
+and purpose. `/thinking` toggles reasoning visibility, like `Ctrl+O`, and
+reports the new state. Model profile and effort changes are persisted with the
+session and restored by resume. `/resume` opens a current-directory session
+selector when no ID is given. In Fish, selecting a session also rebinds that
+Fish process so later `Ctrl+G` turns continue the selected conversation.
+`/compact` immediately summarizes the active branch; automatic compaction uses
+the same path.
 
 When a model profile sets `context_window`, automatic compaction triggers near
 `context_window - max_tokens`. Context usage is anchored to the latest valid

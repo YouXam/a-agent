@@ -7,27 +7,131 @@ use dialoguer::Select;
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
 use rustyline::highlight::Highlighter;
-use rustyline::hint::Hinter;
+use rustyline::hint::{Hint, Hinter};
 use rustyline::history::DefaultHistory;
 use rustyline::validate::Validator;
 use rustyline::{
-    Cmd, CompletionType, ConditionalEventHandler, Context, Editor, Event, EventContext,
-    EventHandler, Helper, KeyCode, KeyEvent, Modifiers, RepeatCount,
+    Cmd, ConditionalEventHandler, Context, Editor, Event, EventContext, EventHandler, Helper,
+    KeyCode, KeyEvent, Modifiers, RepeatCount,
 };
 use unicode_width::UnicodeWidthStr;
 
 use super::InlineRenderer;
 
-const SLASH_COMMANDS: &[&str] = &[
-    "/clear",
-    "/compact",
-    "/effort",
-    "/help",
-    "/model",
-    "/resume",
-    "/status",
-    "/thinking",
+const SLASH_COMMANDS: &[SlashCommand] = &[
+    SlashCommand::new("/model", "/model [profile]", "Switch model profile"),
+    SlashCommand::new("/effort", "/effort [level]", "Set reasoning effort"),
+    SlashCommand::new("/thinking", "/thinking", "Toggle reasoning visibility"),
+    SlashCommand::new("/status", "/status", "Show session and model status"),
+    SlashCommand::new("/clear", "/clear", "Clear the current conversation"),
+    SlashCommand::new("/compact", "/compact", "Summarize the current conversation"),
+    SlashCommand::new(
+        "/resume",
+        "/resume [session-id]",
+        "Resume a session in this cwd",
+    ),
+    SlashCommand::new("/help", "/help", "Show available commands"),
 ];
+
+struct SlashCommand {
+    name: &'static str,
+    usage: &'static str,
+    description: &'static str,
+}
+
+impl SlashCommand {
+    const fn new(name: &'static str, usage: &'static str, description: &'static str) -> Self {
+        Self {
+            name,
+            usage,
+            description,
+        }
+    }
+}
+
+#[derive(Default)]
+struct PaletteState(Mutex<PaletteSelection>);
+
+#[derive(Default)]
+struct PaletteSelection {
+    prefix: String,
+    index: usize,
+}
+
+impl PaletteState {
+    fn selected(&self, prefix: &str, count: usize) -> usize {
+        let Ok(mut state) = self.0.lock() else {
+            return 0;
+        };
+        if state.prefix != prefix {
+            state.prefix = prefix.into();
+            state.index = 0;
+        }
+        state.index = state.index.min(count.saturating_sub(1));
+        state.index
+    }
+
+    fn move_selection(&self, prefix: &str, count: usize, direction: isize) {
+        if count == 0 {
+            return;
+        }
+        let Ok(mut state) = self.0.lock() else {
+            return;
+        };
+        if state.prefix != prefix {
+            state.prefix = prefix.into();
+            state.index = 0;
+        }
+        state.index = (state.index as isize + direction).rem_euclid(count as isize) as usize;
+    }
+
+    fn clear(&self) {
+        if let Ok(mut state) = self.0.lock() {
+            state.prefix.clear();
+            state.index = 0;
+        }
+    }
+}
+
+struct AgentHint(String);
+
+impl Hint for AgentHint {
+    fn display(&self) -> &str {
+        &self.0
+    }
+
+    fn completion(&self) -> Option<&str> {
+        None
+    }
+}
+
+fn command_prefix(line: &str, position: usize) -> Option<&str> {
+    if position != line.len() {
+        return None;
+    }
+    let prefix = &line[..position];
+    (prefix.starts_with('/') && !prefix.chars().any(char::is_whitespace)).then_some(prefix)
+}
+
+fn matching_commands(prefix: &str) -> Vec<&'static SlashCommand> {
+    SLASH_COMMANDS
+        .iter()
+        .filter(|command| command.name.starts_with(prefix))
+        .collect()
+}
+
+fn command_row(command: &SlashCommand, selected: bool, color: bool) -> String {
+    let marker = if selected { '›' } else { ' ' };
+    let row = format!("{marker} {:<22} {}", command.usage, command.description);
+    if !color {
+        return row;
+    }
+    if selected {
+        format!("\x1b[1;96m{row}\x1b[0m")
+    } else {
+        format!("\x1b[90m{row}\x1b[0m")
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputAction {
@@ -47,6 +151,7 @@ pub enum InputMode {
 #[derive(Clone)]
 struct AgentHelper {
     multi: Arc<AtomicBool>,
+    palette: Arc<PaletteState>,
 }
 
 impl Completer for AgentHelper {
@@ -58,29 +163,47 @@ impl Completer for AgentHelper {
         position: usize,
         _context: &Context<'_>,
     ) -> rustyline::Result<(usize, Vec<Self::Candidate>)> {
-        let prefix = &line[..position];
-        if !prefix.starts_with('/') || prefix.chars().any(char::is_whitespace) {
+        let Some(prefix) = command_prefix(line, position) else {
             return Ok((0, Vec::new()));
-        }
-        let candidates = SLASH_COMMANDS
-            .iter()
-            .filter(|command| command.starts_with(prefix))
+        };
+        let commands = matching_commands(prefix);
+        let selected = self.palette.selected(prefix, commands.len());
+        let candidates = commands
+            .get(selected)
             .map(|command| Pair {
-                display: (*command).into(),
-                replacement: (*command).into(),
+                display: command.usage.into(),
+                replacement: format!("{} ", command.name),
             })
+            .into_iter()
             .collect();
         Ok((0, candidates))
     }
 }
 
 impl Hinter for AgentHelper {
-    type Hint = String;
+    type Hint = AgentHint;
 
-    fn hint(&self, line: &str, position: usize, _context: &Context<'_>) -> Option<String> {
+    fn hint(&self, line: &str, position: usize, _context: &Context<'_>) -> Option<AgentHint> {
         if position != line.len() {
+            self.palette.clear();
             return None;
         }
+        if let Some(prefix) = command_prefix(line, position) {
+            let commands = matching_commands(prefix);
+            let selected = self.palette.selected(prefix, commands.len());
+            let color = std::env::var_os("NO_COLOR").is_none();
+            let rows = commands
+                .iter()
+                .enumerate()
+                .map(|(index, command)| command_row(command, index == selected, color))
+                .collect::<Vec<_>>();
+            return Some(AgentHint(if rows.is_empty() {
+                "\n  No matching commands".into()
+            } else {
+                format!("\n{}", rows.join("\n"))
+            }));
+        }
+        self.palette.clear();
         let label = if self.multi.load(Ordering::SeqCst) {
             "multi · tab"
         } else {
@@ -91,12 +214,15 @@ impl Hinter for AgentHelper {
             .unwrap_or(80);
         let used = 3 + UnicodeWidthStr::width(line) + UnicodeWidthStr::width(label);
         (terminal_width > used + 1)
-            .then(|| format!("{}{label}", " ".repeat(terminal_width - used - 1)))
+            .then(|| AgentHint(format!("{}{label}", " ".repeat(terminal_width - used - 1))))
     }
 }
 
 impl Highlighter for AgentHelper {
     fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
+        if hint.starts_with('\n') {
+            return Cow::Borrowed(hint);
+        }
         if self.multi.load(Ordering::SeqCst) {
             Cow::Owned(format!("\x1b[1;95m{hint}\x1b[0m"))
         } else {
@@ -142,9 +268,12 @@ impl ConditionalEventHandler for ReasoningHandler {
     }
 }
 
-struct ModeHandler(Arc<AtomicBool>);
+struct TabHandler {
+    multi: Arc<AtomicBool>,
+    palette: Arc<PaletteState>,
+}
 
-impl ConditionalEventHandler for ModeHandler {
+impl ConditionalEventHandler for TabHandler {
     fn handle(
         &self,
         _event: &Event,
@@ -152,11 +281,32 @@ impl ConditionalEventHandler for ModeHandler {
         _positive: bool,
         context: &EventContext,
     ) -> Option<Cmd> {
-        let prefix = &context.line()[..context.pos()];
-        if prefix.starts_with('/') && !prefix.chars().any(char::is_whitespace) {
+        if let Some(prefix) = command_prefix(context.line(), context.pos()) {
+            let commands = matching_commands(prefix);
+            self.palette.selected(prefix, commands.len());
             return Some(Cmd::Complete);
         }
-        self.0.fetch_xor(true, Ordering::SeqCst);
+        self.multi.fetch_xor(true, Ordering::SeqCst);
+        Some(Cmd::Repaint)
+    }
+}
+
+struct PaletteNavigation {
+    palette: Arc<PaletteState>,
+    direction: isize,
+}
+
+impl ConditionalEventHandler for PaletteNavigation {
+    fn handle(
+        &self,
+        _event: &Event,
+        _repeat: RepeatCount,
+        _positive: bool,
+        context: &EventContext,
+    ) -> Option<Cmd> {
+        let prefix = command_prefix(context.line(), context.pos())?;
+        let count = matching_commands(prefix).len();
+        self.palette.move_selection(prefix, count, self.direction);
         Some(Cmd::Repaint)
     }
 }
@@ -188,15 +338,15 @@ impl InputEditor {
         let rewind_requested = Arc::new(AtomicBool::new(false));
         let reasoning_requested = Arc::new(Mutex::new(None));
         let multi = Arc::new(AtomicBool::new(true));
+        let palette = Arc::new(PaletteState::default());
         let editor_config = rustyline::Config::builder()
-            .completion_type(CompletionType::List)
-            .completion_show_all_if_ambiguous(true)
             .keyseq_timeout(Some(500))
             .build();
         let mut editor = Editor::<AgentHelper, DefaultHistory>::with_config(editor_config)
             .map_err(io::Error::other)?;
         editor.set_helper(Some(AgentHelper {
             multi: multi.clone(),
+            palette: palette.clone(),
         }));
         editor.bind_sequence(
             Event::KeySeq(vec![KeyEvent::from('\x1b'), KeyEvent::from('\x1b')]),
@@ -216,7 +366,24 @@ impl InputEditor {
         );
         editor.bind_sequence(
             KeyEvent(KeyCode::Tab, Modifiers::NONE),
-            EventHandler::Conditional(Box::new(ModeHandler(multi.clone()))),
+            EventHandler::Conditional(Box::new(TabHandler {
+                multi: multi.clone(),
+                palette: palette.clone(),
+            })),
+        );
+        editor.bind_sequence(
+            KeyEvent(KeyCode::Up, Modifiers::NONE),
+            EventHandler::Conditional(Box::new(PaletteNavigation {
+                palette: palette.clone(),
+                direction: -1,
+            })),
+        );
+        editor.bind_sequence(
+            KeyEvent(KeyCode::Down, Modifiers::NONE),
+            EventHandler::Conditional(Box::new(PaletteNavigation {
+                palette,
+                direction: 1,
+            })),
         );
         Ok(Self {
             editor,

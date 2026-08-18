@@ -655,12 +655,29 @@ async fn interactive_tui_is_inline_aligned_and_does_not_duplicate_input() {
     let initial_prompt = tmux_pane(&socket, session).await;
     assert!(initial_prompt.contains("multi · tab"), "{initial_prompt:?}");
     tmux_send_text(&socket, session, "/").await;
-    tmux_send_key(&socket, session, "Tab").await;
     let commands = wait_for_tmux_text(&socket, session, "/thinking").await;
-    assert!(commands.contains("/model"), "{commands:?}");
-    assert!(commands.contains("/compact"), "{commands:?}");
+    assert!(
+        commands.contains("/model [profile]") && commands.contains("Switch model profile"),
+        "{commands:?}"
+    );
+    assert!(
+        commands.contains("/resume [session-id]") && commands.contains("Resume a session"),
+        "{commands:?}"
+    );
+    tmux_send_key(&socket, session, "Down").await;
+    let selected_effort = wait_for_tmux_text(&socket, session, "› /effort [level]").await;
+    assert!(
+        selected_effort.contains("Set reasoning effort"),
+        "{selected_effort:?}"
+    );
+    tmux_send_key(&socket, session, "Up").await;
+    wait_for_tmux_text(&socket, session, "› /model [profile]").await;
+    tmux_send_key(&socket, session, "Down").await;
+    tmux_send_key(&socket, session, "Tab").await;
+    wait_for_tmux_text(&socket, session, "a> /effort").await;
     tmux_send_key(&socket, session, "C-u").await;
     tmux_send_text(&socket, session, "/thi").await;
+    wait_for_tmux_text(&socket, session, "› /thinking").await;
     tmux_send_key(&socket, session, "Tab").await;
     wait_for_tmux_text(&socket, session, "a> /thinking").await;
     tmux_send_key(&socket, session, "C-u").await;
