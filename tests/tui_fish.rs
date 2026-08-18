@@ -190,6 +190,18 @@ fn tool_input_and_output_are_bounded_with_visible_truncation() {
         result: ToolResult::error("bash-1", "ignored\n[exit code: 1]"),
     });
     let plain = String::from_utf8(writer.bytes()).unwrap();
+    let lines = plain.lines().collect::<Vec<_>>();
+    let status_index = lines
+        .iter()
+        .position(|line| *line == "× bash  exit 1")
+        .expect("completed Bash status missing");
+    let command_index = lines
+        .iter()
+        .position(|line| line.starts_with("  $ "))
+        .expect("Bash command missing");
+    assert!(status_index < command_index, "{plain}");
+    assert!(!plain.contains("● bash"), "{plain}");
+    assert_eq!(plain.matches("× bash  exit 1").count(), 1, "{plain}");
     assert!(
         plain.lines().any(|line| line.starts_with("  $ ")),
         "{plain}"

@@ -397,7 +397,11 @@ impl State {
         Ok(())
     }
 
-    fn render_tool_input(&mut self, id: &str) -> io::Result<()> {
+    fn render_tool_input(
+        &mut self,
+        id: &str,
+        bash_completion: Option<(&str, Color, &str)>,
+    ) -> io::Result<()> {
         let Some(tool) = self.tools.get_mut(id) else {
             return Ok(());
         };
@@ -422,7 +426,18 @@ impl State {
                 )
             }
             "bash" => {
-                write_tool_header(&mut self.writer, self.color, &name, None)?;
+                if let Some((symbol, color, summary)) = bash_completion {
+                    write_tool_completion(
+                        &mut self.writer,
+                        self.color,
+                        symbol,
+                        color,
+                        &name,
+                        summary,
+                    )?;
+                } else {
+                    write_tool_header(&mut self.writer, self.color, &name, None)?;
+                }
                 let input = limited_text(
                     &format_tool_input(&name, &raw_arguments),
                     self.limits.tool_input_max_bytes,
@@ -445,10 +460,24 @@ impl State {
     }
 
     fn render_tool_result(&mut self, id: &str, result: &ToolResult) -> io::Result<()> {
-        self.render_tool_input(id)?;
-        let (name, output) = match self.tools.get(id) {
+        let name = self
+            .tools
+            .get(id)
+            .map(|tool| tool.name.clone())
+            .unwrap_or_else(|| "tool".to_owned());
+        let exit_code = parse_exit_code(&result.output);
+        let bash_interrupted = name == "bash"
+            && (result.output.contains("[bash cancelled]")
+                || result.output.contains("[bash timed out after "));
+        let failed = result.is_error || bash_interrupted || exit_code.is_some_and(|code| code != 0);
+        let symbol = if failed { "×" } else { "✓" };
+        let color = if failed { Color::Red } else { Color::Green };
+        let summary = tool_summary(&name, result, exit_code);
+        let bash_completion = (name == "bash").then_some((symbol, color, summary.as_str()));
+        self.render_tool_input(id, bash_completion)?;
+        let output = match self.tools.get(id) {
             Some(tool) => {
-                let output = if tool.output.total_bytes > 0 {
+                if tool.output.total_bytes > 0 {
                     tool.output.limited(self.limits.tool_output_max_lines)
                 } else {
                     limited_text(
@@ -457,17 +486,13 @@ impl State {
                         self.limits.tool_output_max_lines,
                         tool.name == "bash",
                     )
-                };
-                (tool.name.clone(), output)
+                }
             }
-            None => (
-                "tool".to_owned(),
-                limited_text(
-                    &result.output,
-                    self.limits.tool_output_max_bytes,
-                    self.limits.tool_output_max_lines,
-                    false,
-                ),
+            None => limited_text(
+                &result.output,
+                self.limits.tool_output_max_bytes,
+                self.limits.tool_output_max_lines,
+                false,
             ),
         };
         match name.as_str() {
@@ -485,21 +510,9 @@ impl State {
                 output.truncated,
             )?,
         }
-        let exit_code = parse_exit_code(&result.output);
-        let bash_interrupted = name == "bash"
-            && (result.output.contains("[bash cancelled]")
-                || result.output.contains("[bash timed out after "));
-        let failed = result.is_error || bash_interrupted || exit_code.is_some_and(|code| code != 0);
-        let symbol = if failed { "×" } else { "✓" };
-        let color = if failed { Color::Red } else { Color::Green };
-        let summary = tool_summary(&name, result, exit_code);
-        write_styled(
-            &mut self.writer,
-            self.color,
-            &format!("{symbol} {name}  {summary}\n"),
-            color,
-            true,
-        )?;
+        if name != "bash" {
+            write_tool_completion(&mut self.writer, self.color, symbol, color, &name, &summary)?;
+        }
         self.tools.remove(id);
         Ok(())
     }
@@ -822,6 +835,23 @@ fn write_tool_header(
         )?;
     }
     writeln!(writer)
+}
+
+fn write_tool_completion(
+    writer: &mut dyn Write,
+    color_enabled: bool,
+    symbol: &str,
+    color: Color,
+    name: &str,
+    summary: &str,
+) -> io::Result<()> {
+    write_styled(
+        writer,
+        color_enabled,
+        &format!("{symbol} {name}  {summary}\n"),
+        color,
+        true,
+    )
 }
 
 fn render_read_call(

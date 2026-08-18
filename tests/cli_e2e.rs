@@ -670,6 +670,7 @@ tool_output_max_bytes = 4096
     assert!(final_pane.contains("live-8"), "{final_pane:?}");
     assert!(!final_pane.contains("live-1"), "{final_pane:?}");
     assert!(final_pane.contains("✓ bash  exit 0"), "{final_pane:?}");
+    assert!(!final_history.contains("● bash"), "{final_history:?}");
     assert!(
         !["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
             .iter()
