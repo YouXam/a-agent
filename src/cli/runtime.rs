@@ -283,7 +283,7 @@ pub async fn run() -> Result<i32> {
             }
             InputAction::Submit(_, _) => {}
             InputAction::ToggleReasoning => {
-                renderer.toggle_reasoning()?;
+                toggle_reasoning(&renderer)?;
             }
             InputAction::Rewind => {
                 let checkpoints = store
@@ -567,6 +567,16 @@ fn resume_session(
     Ok(())
 }
 
+fn toggle_reasoning(renderer: &InlineRenderer) -> Result<()> {
+    let visible = renderer.toggle_reasoning()?;
+    renderer.render_status(if visible {
+        "reasoning: expanded"
+    } else {
+        "reasoning: collapsed"
+    })?;
+    Ok(())
+}
+
 fn handle_slash_command(
     input: &str,
     config: &Config,
@@ -659,6 +669,10 @@ fn handle_slash_command(
             Ok(SlashAction::Handled)
         }
         "/compact" => Ok(SlashAction::Compact),
+        "/thinking" => {
+            toggle_reasoning(renderer)?;
+            Ok(SlashAction::Handled)
+        }
         "/resume" => {
             let resumed = if let Some(id) = argument {
                 store
@@ -697,8 +711,9 @@ fn handle_slash_command(
             Ok(SlashAction::Resume(resumed))
         }
         "/help" => {
-            renderer
-                .render_status("commands: /model /effort /status /clear /compact /resume /help")?;
+            renderer.render_status(
+                "commands: /model /effort /thinking /status /clear /compact /resume /help",
+            )?;
             Ok(SlashAction::Handled)
         }
         _ => {

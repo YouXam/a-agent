@@ -4,6 +4,9 @@
 if not set -q __a_fish_session_key
     set -g __a_fish_session_key (string join '' a_fish_ $fish_pid _ (date +%s) _ (random) _ (random))
 end
+if not set -q __a_ai_turn_mode
+    set -g __a_ai_turn_mode once
+end
 
 function __a_preexec --on-event fish_preexec
     set -g __a_command $argv[1]
@@ -77,7 +80,6 @@ function __a_ai_prompt
     commandline -r ''
     commandline -f repaint
 
-    set -g __a_ai_turn_mode once
     while true
         set -g __a_ai_prompt_active 1
         set -l prompt
@@ -99,12 +101,10 @@ function __a_ai_prompt
             printf '\e[%dA\r\e[J' $clear_rows
             commandline -r "$shell_text"
             commandline -f repaint
-            set -e __a_ai_turn_mode
             return
         end
 
         if test $read_status -ne 0
-            set -e __a_ai_turn_mode
             commandline -f repaint
             return
         end
@@ -114,12 +114,10 @@ function __a_ai_prompt
             command a --fish-ai --fish-session-key "$__a_fish_session_key" --one-turn
             set -l agent_status $status
             if test "$__a_ai_turn_mode" = once
-                set -e __a_ai_turn_mode
                 return $agent_status
             end
             set shell_prompt_rows 1
         else if test "$__a_ai_turn_mode" = once
-            set -e __a_ai_turn_mode
             commandline -f repaint
             return
         end

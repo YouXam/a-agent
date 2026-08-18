@@ -370,6 +370,48 @@ model = "test-model"
     assert!(String::from_utf8_lossy(&output.stdout).contains("no conversation to compact"));
 }
 
+#[tokio::test]
+async fn thinking_command_toggles_locally_without_an_api_request() {
+    let temp = tempdir().unwrap();
+    let home = temp.path().join("home");
+    let repo = temp.path().join("repo");
+    let state = temp.path().join("state");
+    fs::create_dir_all(home.join(".config/a")).unwrap();
+    fs::create_dir_all(&repo).unwrap();
+    fs::write(
+        home.join(".config/a/config.toml"),
+        r#"
+default_model = "test"
+[providers.test]
+type = "responses"
+api_key = "secret"
+[models.test]
+provider = "test"
+model = "test-model"
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_a"))
+        .args(["-1", "/thinking"])
+        .current_dir(&repo)
+        .env("HOME", &home)
+        .env("XDG_STATE_HOME", &state)
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("reasoning: expanded"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn fish_model_command_opens_an_arrow_key_selector() {
@@ -612,6 +654,16 @@ async fn interactive_tui_is_inline_aligned_and_does_not_duplicate_input() {
     wait_for_agent_prompt(&socket, session).await;
     let initial_prompt = tmux_pane(&socket, session).await;
     assert!(initial_prompt.contains("multi · tab"), "{initial_prompt:?}");
+    tmux_send_text(&socket, session, "/").await;
+    tmux_send_key(&socket, session, "Tab").await;
+    let commands = wait_for_tmux_text(&socket, session, "/thinking").await;
+    assert!(commands.contains("/model"), "{commands:?}");
+    assert!(commands.contains("/compact"), "{commands:?}");
+    tmux_send_key(&socket, session, "C-u").await;
+    tmux_send_text(&socket, session, "/thi").await;
+    tmux_send_key(&socket, session, "Tab").await;
+    wait_for_tmux_text(&socket, session, "a> /thinking").await;
+    tmux_send_key(&socket, session, "C-u").await;
     assert!(
         Command::new("tmux")
             .args(["-L", &socket, "send-keys", "-t", session, "-l", "hi"])
@@ -646,7 +698,14 @@ async fn interactive_tui_is_inline_aligned_and_does_not_duplicate_input() {
         .await
         .unwrap();
     assert_eq!(String::from_utf8_lossy(&alternate.stdout).trim(), "0");
-    assert_eq!(screen.matches("hi").count(), 1, "{screen:?}");
+    assert_eq!(
+        screen
+            .lines()
+            .filter(|line| line.starts_with("a> hi"))
+            .count(),
+        1,
+        "{screen:?}"
+    );
     assert!(
         screen.lines().any(|line| line.starts_with("a> hi")),
         "{screen:?}"
@@ -659,13 +718,17 @@ async fn interactive_tui_is_inline_aligned_and_does_not_duplicate_input() {
         screen.lines().any(|line| line.starts_with("│ Ready.")),
         "{screen:?}"
     );
-    assert!(!history.contains("thinking"), "{history:?}");
     assert!(
         !["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
             .iter()
             .any(|spinner| history.contains(spinner)),
         "{history:?}"
     );
+
+    tmux_send_key(&socket, session, "C-o").await;
+    wait_for_tmux_text(&socket, session, "reasoning: expanded").await;
+    tmux_send_key(&socket, session, "C-o").await;
+    wait_for_tmux_text(&socket, session, "reasoning: collapsed").await;
 
     tmux_send_key(&socket, session, "Escape").await;
     let single_escape = wait_for_tmux_text(&socket, session, "Rewind to:").await;

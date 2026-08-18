@@ -142,6 +142,7 @@ Interactive commands:
 ```text
 /model [profile]
 /effort [level]
+/thinking
 /status
 /clear
 /compact
@@ -149,10 +150,12 @@ Interactive commands:
 /help
 ```
 
-Without an argument, `/model` and `/effort` open an arrow-key selector. Model
-profile and effort changes are persisted with the session and restored by
-resume. `/resume` opens a current-directory session selector when no ID is
-given. In Fish, selecting a session also rebinds that Fish process so later
+Without an argument, `/model` and `/effort` open an arrow-key selector. Type
+`/` and press `Tab` to list commands; a unique prefix is completed in place.
+`/thinking` toggles reasoning visibility, like `Ctrl+O`, and reports the new
+state. Model profile and effort changes are persisted with the session and
+restored by resume. `/resume` opens a current-directory session selector when
+no ID is given. In Fish, selecting a session also rebinds that Fish process so later
 `Ctrl+G` turns continue the selected conversation. `/compact` immediately
 summarizes the active branch; automatic compaction uses the same path.
 
@@ -236,7 +239,9 @@ dedicated `a> ` input prompt. It deliberately does not enable Fish `--shell`
 mode, so shell syntax highlighting and autosuggestions do not apply. The right
 prompt shows `once · tab` by default; press `Tab` to switch to `multi · tab`.
 Once mode returns to Fish after one response. Multi mode keeps showing `a> `
-after each response until it is switched back to once or cancelled.
+after each response until it is switched back to once or cancelled. The mode
+choice is retained for the lifetime of that Fish process, including across
+`Ctrl+G` and `Ctrl+C` exits from AI input.
 Press `Ctrl+G` again to restore the current text to the normal Fish editor on
 the same line. Press `Ctrl+C` to cancel the AI input line and open a fresh Fish
 prompt.

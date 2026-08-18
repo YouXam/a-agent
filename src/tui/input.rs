@@ -11,12 +11,23 @@ use rustyline::hint::Hinter;
 use rustyline::history::DefaultHistory;
 use rustyline::validate::Validator;
 use rustyline::{
-    Cmd, ConditionalEventHandler, Context, Editor, Event, EventContext, EventHandler, Helper,
-    KeyCode, KeyEvent, Modifiers, RepeatCount,
+    Cmd, CompletionType, ConditionalEventHandler, Context, Editor, Event, EventContext,
+    EventHandler, Helper, KeyCode, KeyEvent, Modifiers, RepeatCount,
 };
 use unicode_width::UnicodeWidthStr;
 
 use super::InlineRenderer;
+
+const SLASH_COMMANDS: &[&str] = &[
+    "/clear",
+    "/compact",
+    "/effort",
+    "/help",
+    "/model",
+    "/resume",
+    "/status",
+    "/thinking",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputAction {
@@ -40,6 +51,27 @@ struct AgentHelper {
 
 impl Completer for AgentHelper {
     type Candidate = Pair;
+
+    fn complete(
+        &self,
+        line: &str,
+        position: usize,
+        _context: &Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<Self::Candidate>)> {
+        let prefix = &line[..position];
+        if !prefix.starts_with('/') || prefix.chars().any(char::is_whitespace) {
+            return Ok((0, Vec::new()));
+        }
+        let candidates = SLASH_COMMANDS
+            .iter()
+            .filter(|command| command.starts_with(prefix))
+            .map(|command| Pair {
+                display: (*command).into(),
+                replacement: (*command).into(),
+            })
+            .collect();
+        Ok((0, candidates))
+    }
 }
 
 impl Hinter for AgentHelper {
@@ -118,8 +150,12 @@ impl ConditionalEventHandler for ModeHandler {
         _event: &Event,
         _repeat: RepeatCount,
         _positive: bool,
-        _context: &EventContext,
+        context: &EventContext,
     ) -> Option<Cmd> {
+        let prefix = &context.line()[..context.pos()];
+        if prefix.starts_with('/') && !prefix.chars().any(char::is_whitespace) {
+            return Some(Cmd::Complete);
+        }
         self.0.fetch_xor(true, Ordering::SeqCst);
         Some(Cmd::Repaint)
     }
@@ -153,6 +189,8 @@ impl InputEditor {
         let reasoning_requested = Arc::new(Mutex::new(None));
         let multi = Arc::new(AtomicBool::new(true));
         let editor_config = rustyline::Config::builder()
+            .completion_type(CompletionType::List)
+            .completion_show_all_if_ambiguous(true)
             .keyseq_timeout(Some(500))
             .build();
         let mut editor = Editor::<AgentHelper, DefaultHistory>::with_config(editor_config)

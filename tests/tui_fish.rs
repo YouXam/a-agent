@@ -306,6 +306,7 @@ fn fish_script_has_metadata_hooks_dedicated_ai_read_and_mode_bindings() {
     assert!(script.contains("multi · tab"));
     assert!(script.contains("__a_handle_tab"));
     assert!(script.contains("__a_ai_prompt_active"));
+    assert!(!script.contains("set -e __a_ai_turn_mode"));
     assert!(!script.contains("--shell"));
     assert!(script.contains("bind -M default \\cg __a_ai_prompt"));
     assert!(script.contains("bind -M insert \\cg __a_ai_prompt"));
@@ -405,11 +406,22 @@ async fn new_fish_has_immediate_ai_prompt_without_shell_completion_and_invokes_a
     );
     assert!(!normal_mode.contains("a> git che"), "{normal_mode:?}");
 
+    tmux_key(&socket, session, "C-g").await;
+    wait_for_last_line(&socket, session, |line| {
+        line.contains("a>") && line.contains("multi · tab")
+    })
+    .await;
+    tmux_key(&socket, session, "C-g").await;
+    wait_for_last_line(&socket, session, |line| line.contains("[1]#")).await;
+
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     tmux_key(&socket, session, "C-c").await;
     wait_for_prompt(&socket, session).await;
     tmux_key(&socket, session, "C-g").await;
-    wait_for_last_line(&socket, session, |line| line.contains("a>")).await;
+    wait_for_last_line(&socket, session, |line| {
+        line.contains("a>") && line.contains("multi · tab")
+    })
+    .await;
     tmux_type(&socket, session, "cancel me").await;
     tmux_key(&socket, session, "C-c").await;
     let interrupted = wait_for_last_line(&socket, session, |line| line.contains("[1]#")).await;
@@ -417,9 +429,11 @@ async fn new_fish_has_immediate_ai_prompt_without_shell_completion_and_invokes_a
 
     tmux_key(&socket, session, "C-g").await;
     wait_for_last_line(&socket, session, |line| {
-        line.contains("a>") && line.contains("once · tab")
+        line.contains("a>") && line.contains("multi · tab")
     })
     .await;
+    tmux_key(&socket, session, "Tab").await;
+    wait_for_last_line(&socket, session, |line| line.contains("once · tab")).await;
     tmux_key(&socket, session, "Tab").await;
     wait_for_last_line(&socket, session, |line| line.contains("multi · tab")).await;
     tmux_type(&socket, session, "first turn").await;
