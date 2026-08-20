@@ -503,22 +503,13 @@ impl InputEditor {
             renderer.render_status("no user messages to rewind to")?;
             return Ok(None);
         }
-        renderer.render_rewind_options(checkpoints)?;
-        loop {
-            match self
-                .editor
-                .readline(&("rewind> ", "\x1b[1;35mrewind> \x1b[0m"))
-            {
-                Ok(value) if value.trim().is_empty() => return Ok(None),
-                Ok(value) => match value.trim().parse::<usize>() {
-                    Ok(index) if (1..=checkpoints.len()).contains(&index) => {
-                        return Ok(Some(checkpoints[index - 1].0.clone()));
-                    }
-                    _ => renderer.render_status("enter a checkpoint number, or blank to cancel")?,
-                },
-                Err(ReadlineError::Interrupted | ReadlineError::Eof) => return Ok(None),
-                Err(error) => return Err(io::Error::other(error)),
-            }
-        }
+        let labels = checkpoints
+            .iter()
+            .map(|(_, label)| label.clone())
+            .collect::<Vec<_>>();
+        let Some(index) = self.select_option("Rewind to", &labels, 0)? else {
+            return Ok(None);
+        };
+        Ok(Some(checkpoints[index].0.clone()))
     }
 }

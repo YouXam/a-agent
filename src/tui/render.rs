@@ -187,29 +187,6 @@ impl InlineRenderer {
         })
     }
 
-    pub fn render_rewind_options(&self, choices: &[(String, String)]) -> io::Result<()> {
-        self.with_state(|state| {
-            state.finish_open_lines()?;
-            write_styled(
-                &mut state.writer,
-                state.color,
-                "Rewind to:\n",
-                Color::Magenta,
-                true,
-            )?;
-            for (index, (_, label)) in choices.iter().enumerate() {
-                write_styled(
-                    &mut state.writer,
-                    state.color,
-                    &format!("  {}  {label}\n", index + 1),
-                    Color::Grey,
-                    false,
-                )?;
-            }
-            state.writer.flush()
-        })
-    }
-
     pub fn render_resumed_history(&self, items: &[ConversationItem]) -> io::Result<()> {
         self.begin_turn()?;
         self.with_state(|state| {

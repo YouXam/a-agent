@@ -208,7 +208,8 @@ silently continue the cancelled task.
 In interactive mode, press `Esc` to select a previous user checkpoint. A
 second `Esc` triggers it immediately instead of waiting for the terminal's
 500 ms escape-sequence timeout. Rewind moves the session HEAD; it does not
-delete the old branch.
+delete the old branch. The picker uses `Up`/`Down`, `Enter`, and `Esc`, and
+includes persisted user checkpoints from before compaction.
 
 Default controls:
 

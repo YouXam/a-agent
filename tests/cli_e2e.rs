@@ -928,9 +928,19 @@ async fn interactive_tui_is_inline_aligned_and_does_not_duplicate_input() {
     wait_for_tmux_text(&socket, session, "reasoning: collapsed").await;
 
     tmux_send_key(&socket, session, "Escape").await;
-    let single_escape = wait_for_tmux_text(&socket, session, "rewind>").await;
+    let single_escape = wait_for_tmux_text(&socket, session, "\n> hi").await;
     assert!(single_escape.contains("Rewind to:"), "{single_escape:?}");
-    tmux_send_key(&socket, session, "C-c").await;
+    assert!(!single_escape.contains("rewind>"), "{single_escape:?}");
+    assert!(
+        !single_escape
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or_default()
+            .contains("multi · tab"),
+        "{single_escape:?}"
+    );
+    tmux_send_key(&socket, session, "Escape").await;
     wait_for_agent_prompt(&socket, session).await;
     tmux_send_text(&socket, session, "retained").await;
     let after_single_escape = wait_for_tmux_text(&socket, session, "a> retained").await;
@@ -956,18 +966,12 @@ async fn interactive_tui_is_inline_aligned_and_does_not_duplicate_input() {
             .unwrap()
             .success()
     );
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-    let rewind = Command::new("tmux")
-        .args(["-L", &socket, "capture-pane", "-p", "-t", session])
-        .output()
-        .await
-        .unwrap();
-    let rewind = String::from_utf8(rewind.stdout).unwrap();
+    let rewind = wait_for_tmux_text(&socket, session, "\n> hi").await;
     assert!(rewind.contains("Rewind to:"), "{rewind:?}");
-    assert!(rewind.contains("rewind>"), "{rewind:?}");
+    assert!(!rewind.contains("rewind>"), "{rewind:?}");
 
     let _ = Command::new("tmux")
-        .args(["-L", &socket, "send-keys", "-t", session, "C-c"])
+        .args(["-L", &socket, "send-keys", "-t", session, "Escape"])
         .status()
         .await;
     let _ = Command::new("tmux")

@@ -278,6 +278,55 @@ fn rewind_moves_head_without_deleting_old_branch() {
 }
 
 #[test]
+fn compaction_keeps_prior_user_messages_available_for_rewind() {
+    let mut store = SessionStore::open_in_memory().unwrap();
+    let session = store
+        .create_session(NewSession::new("/repo", "responses", "model"))
+        .unwrap();
+    let first = store
+        .append_item(
+            &session.id,
+            Role::User,
+            vec![ContentBlock::Text("first request".into())],
+        )
+        .unwrap();
+    store
+        .append_item(
+            &session.id,
+            Role::Assistant,
+            vec![ContentBlock::Text("first answer".into())],
+        )
+        .unwrap();
+    let second = store
+        .append_item(
+            &session.id,
+            Role::User,
+            vec![ContentBlock::Text("second request".into())],
+        )
+        .unwrap();
+    store
+        .replace_branch_with_summary(&session.id, "summary")
+        .unwrap();
+
+    assert!(
+        store
+            .active_branch(&session.id)
+            .unwrap()
+            .iter()
+            .all(|item| item.id != first.id && item.id != second.id)
+    );
+    assert_eq!(
+        store
+            .user_checkpoints(&session.id)
+            .unwrap()
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect::<Vec<_>>(),
+        [first.id.as_str(), second.id.as_str()]
+    );
+}
+
+#[test]
 fn shell_history_is_bounded_and_cwd_scoped() {
     let store = SessionStore::open_in_memory().unwrap();
     for index in 0..5 {

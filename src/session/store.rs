@@ -417,13 +417,12 @@ impl SessionStore {
     }
 
     pub fn user_checkpoints(&self, session_id: &str) -> Result<Vec<ConversationItem>> {
-        let mut checkpoints = Vec::new();
-        for item in self.active_branch(session_id)? {
-            if item.role == Role::User && self.stored_item_kind(&item.id)? == "user_message" {
-                checkpoints.push(item);
-            }
-        }
-        Ok(checkpoints)
+        let mut statement = self.connection.prepare(
+            "SELECT id, session_id, parent_id, role, content_json, usage_json, created_at FROM conversation_items WHERE session_id = ?1 AND kind = 'user_message' ORDER BY created_at ASC, rowid ASC",
+        )?;
+        let rows = statement.query_map([session_id], row_to_item)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     pub fn count_items(&self, session_id: &str) -> Result<usize> {
@@ -552,16 +551,6 @@ impl SessionStore {
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
-    }
-
-    fn stored_item_kind(&self, item_id: &str) -> Result<String> {
-        self.connection
-            .query_row(
-                "SELECT kind FROM conversation_items WHERE id = ?1",
-                [item_id],
-                |row| row.get(0),
-            )
             .map_err(Into::into)
     }
 

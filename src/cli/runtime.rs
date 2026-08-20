@@ -307,9 +307,7 @@ pub async fn run() -> Result<i32> {
                             .blocks
                             .iter()
                             .find_map(|block| match block {
-                                ContentBlock::Text(text) => {
-                                    Some(text.lines().last().unwrap_or(text).to_owned())
-                                }
+                                ContentBlock::Text(text) => Some(session_preview(text)),
                                 _ => None,
                             })
                             .unwrap_or_else(|| item.id.clone());
