@@ -1,4 +1,6 @@
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -85,7 +87,7 @@ async fn read_rejects_binary_and_allows_paths_outside_the_workspace() {
 }
 
 #[tokio::test]
-async fn patch_adds_updates_and_deletes_atomically() {
+async fn patch_adds_updates_and_deletes() {
     let temp = tempdir().unwrap();
     fs::create_dir(temp.path().join("src")).unwrap();
     fs::write(temp.path().join("src/old.txt"), "old\nline\n").unwrap();
@@ -102,6 +104,32 @@ async fn patch_adds_updates_and_deletes_atomically() {
     );
     assert!(!temp.path().join("remove.txt").exists());
     assert_eq!(summary.files.len(), 3);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn patch_updates_preserve_inode_permissions_owner_and_hard_links() {
+    let temp = tempdir().unwrap();
+    let script = temp.path().join("script.sh");
+    let hard_link = temp.path().join("script-link.sh");
+    fs::write(&script, "#!/bin/sh\necho old\n").unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o751)).unwrap();
+    fs::hard_link(&script, &hard_link).unwrap();
+    let before = fs::metadata(&script).unwrap();
+
+    let patch =
+        "*** Begin Patch\n*** Update File: script.sh\n@@\n-echo old\n+echo new\n*** End Patch";
+    apply_patch(temp.path(), patch).await.unwrap();
+
+    let after = fs::metadata(&script).unwrap();
+    assert_eq!(after.ino(), before.ino());
+    assert_eq!(after.mode() & 0o7777, 0o751);
+    assert_eq!(after.uid(), before.uid());
+    assert_eq!(after.gid(), before.gid());
+    assert_eq!(
+        fs::read_to_string(&hard_link).unwrap(),
+        "#!/bin/sh\necho new\n"
+    );
 }
 
 #[tokio::test]

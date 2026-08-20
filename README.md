@@ -231,6 +231,9 @@ live output tail, `read` shows the path/range and a numbered preview, and
 fall back to labeled input/output blocks. Configure display limits with
 `ui.tool_input_max_bytes`, `ui.tool_output_max_bytes`, and
 `ui.tool_output_max_lines`.
+`apply_patch` updates existing files in place so permissions, ownership, hard
+links, ACLs, and extended attributes remain attached to the same inode. New
+files use the process's normal umask.
 The transient parallel-tool panel keeps the latest
 `ui.tool_live_output_lines` lines per running tool.
 A transient spinner remains below the currently streamed reasoning or assistant

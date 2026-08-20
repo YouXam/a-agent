@@ -1,5 +1,5 @@
 use std::collections::BTreeSet;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -40,7 +40,12 @@ enum HunkLine {
 }
 
 enum Prepared {
-    Write {
+    Add {
+        path: PathBuf,
+        content: String,
+        summary: PatchFileSummary,
+    },
+    Update {
         path: PathBuf,
         content: String,
         summary: PatchFileSummary,
@@ -90,7 +95,7 @@ pub async fn apply_patch(root: &Path, patch: &str) -> Result<PatchSummary> {
                     anyhow::bail!("cannot add existing file: {path}");
                 }
                 let added = content.lines().count();
-                prepared.push(Prepared::Write {
+                prepared.push(Prepared::Add {
                     path: resolved,
                     content,
                     summary: PatchFileSummary {
@@ -118,7 +123,7 @@ pub async fn apply_patch(root: &Path, patch: &str) -> Result<PatchSummary> {
                 let source = fs::read_to_string(&resolved)
                     .with_context(|| format!("read file before update: {path}"))?;
                 let (content, added, removed) = apply_hunks(&source, &hunks, &path)?;
-                prepared.push(Prepared::Write {
+                prepared.push(Prepared::Update {
                     path: resolved,
                     content,
                     summary: PatchFileSummary {
@@ -134,20 +139,41 @@ pub async fn apply_patch(root: &Path, patch: &str) -> Result<PatchSummary> {
     let mut summaries = Vec::new();
     for operation in prepared {
         match operation {
-            Prepared::Write {
+            Prepared::Add {
                 path,
                 content,
                 summary,
             } => {
                 let parent = path.parent().context("patch target has no parent")?;
                 fs::create_dir_all(parent)?;
-                let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-                temporary.write_all(content.as_bytes())?;
-                temporary.as_file().sync_all()?;
-                temporary
-                    .persist(&path)
-                    .map_err(|error| error.error)
-                    .with_context(|| format!("atomically write {}", path.display()))?;
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)
+                    .with_context(|| format!("create {}", path.display()))?;
+                let result = file
+                    .write_all(content.as_bytes())
+                    .and_then(|()| file.sync_all());
+                if let Err(error) = result {
+                    drop(file);
+                    let _ = fs::remove_file(&path);
+                    return Err(error)
+                        .with_context(|| format!("write new file {}", path.display()));
+                }
+                summaries.push(summary);
+            }
+            Prepared::Update {
+                path,
+                content,
+                summary,
+            } => {
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .open(&path)
+                    .with_context(|| format!("open {} for update", path.display()))?;
+                file.write_all(content.as_bytes())?;
+                file.sync_all()?;
                 summaries.push(summary);
             }
             Prepared::Delete { path, summary } => {
