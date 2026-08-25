@@ -8,7 +8,16 @@ license = "MIT"
 readme = "README.md"
 repository = "https://github.com/YouXam/a-agent"
 homepage = "https://github.com/YouXam/a-agent"
-publish = false
+keywords = ["ai", "agent", "cli", "terminal", "developer-tools"]
+categories = ["command-line-utilities", "development-tools"]
+include = [
+    "src/**",
+    "tests/**",
+    "assets/**",
+    "config.example.toml",
+    "README.md",
+    "LICENSE",
+]
 
 [[bin]]
 name = "a"

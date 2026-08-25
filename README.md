@@ -16,6 +16,8 @@ Its core stays intentionally small:
 Rust 1.95 or newer is required.
 
 ```bash
+cargo install a-agent
+# Or install the current checkout:
 cargo build --release
 cargo install --path .
 ```
