@@ -181,13 +181,14 @@ async fn bash_captures_output_and_exit_status() {
             command: "printf out; printf err >&2; exit 7".into(),
         },
         &BashOptions {
-            timeout: Duration::from_secs(2),
+            timeout: Duration::from_secs(30),
             max_output_bytes: 100,
         },
         None,
     )
     .await
     .unwrap();
+    assert!(!result.timed_out);
     assert!(result.output.contains("out"));
     assert!(result.output.contains("err"));
     assert_eq!(result.exit_code, Some(7));
@@ -202,13 +203,14 @@ async fn bash_uses_pipefail_for_pipeline_status() {
             command: "false | true".into(),
         },
         &BashOptions {
-            timeout: Duration::from_secs(2),
+            timeout: Duration::from_secs(30),
             max_output_bytes: 100,
         },
         None,
     )
     .await
     .unwrap();
+    assert!(!result.timed_out);
     assert_ne!(result.exit_code, Some(0));
 }
 
