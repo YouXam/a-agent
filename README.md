@@ -299,3 +299,22 @@ argument is the number of turns preloaded into the baseline session:
 node scripts/bench-resume.mjs target/release/a 100 1
 node scripts/bench-resume.mjs target/release/a 50 100
 ```
+
+## Release
+
+Releases are published to crates.io by
+[`.github/workflows/publish.yml`](.github/workflows/publish.yml). Authentication
+uses crates.io Trusted Publishing over GitHub OIDC, so no registry token is
+stored in the repository.
+
+Pushing a `v<version>` tag runs the release job. The tag must match the version
+in `Cargo.toml`, and formatting, Clippy, the full test suite, and
+`cargo publish --dry-run` must pass before the upload. If the version is already
+on crates.io, the upload is skipped instead of failing, so a run can be safely
+repeated. The workflow can also be started manually with `workflow_dispatch`,
+which skips only the tag check.
+
+```bash
+git tag -a v0.1.0 -m 'a-agent 0.1.0'
+git push origin v0.1.0
+```
