@@ -19,6 +19,11 @@ function __a_postexec --on-event fish_postexec
     if not set -q __a_started_at
         return
     end
+    # __a_ai_turn is the AI turn itself, not a command the user ran, so it never
+    # enters the recorded shell context.
+    if test "$__a_command" = __a_ai_turn
+        return
+    end
     set -l exit_code $execution_snapshot[1]
     set -l pipe_status (string join ' ' $execution_snapshot[2..])
     set -l finished_at (date +%s%3N)
@@ -33,15 +38,34 @@ function __a_postexec --on-event fish_postexec
         --duration-ms "$duration_ms" >/dev/null 2>&1
 end
 
+# Fish saves and restores $status around key bindings and event handlers, and
+# $status itself is read-only, so a turn started from inside the Ctrl+G binding
+# can never set the shell's exit code. Running the turn as a real command line
+# is the only way, and then $status is simply the agent's exit code. Fish echoes
+# the command line it runs and adds it to history, so this removes itself from
+# history and erases the echoed line before the agent writes anything.
+function __a_ai_turn
+    history delete --exact --case-sensitive -- __a_ai_turn >/dev/null 2>&1
+    set -l rows 1
+    if set -q __a_ai_turn_rows
+        set rows $__a_ai_turn_rows
+        set -e __a_ai_turn_rows
+    end
+    printf '\e[%dA\r\e[J' $rows
+    set -lx A_FISH_AI_PROMPT "$__a_ai_pending_prompt"
+    set -e __a_ai_pending_prompt
+    command a --fish-ai --fish-session-key "$__a_fish_session_key" --one-turn
+end
+
 function __a_render_ai_prompt
-    set_color --bold brcyan
+    set_color --bold cyan
     printf 'a> '
     set_color normal
 end
 
 function __a_render_ai_right_prompt
     if test "$__a_ai_turn_mode" = multi
-        set_color --bold brmagenta
+        set_color --bold magenta
         printf 'multi · tab'
     else
         set_color brblack
@@ -110,12 +134,15 @@ function __a_ai_prompt
         end
 
         if test -n (string trim -- "$prompt")
+            if test "$__a_ai_turn_mode" = once
+                set -g __a_ai_pending_prompt "$prompt"
+                set -g __a_ai_turn_rows $shell_prompt_rows
+                commandline -r __a_ai_turn
+                commandline -f execute
+                return
+            end
             set -lx A_FISH_AI_PROMPT "$prompt"
             command a --fish-ai --fish-session-key "$__a_fish_session_key" --one-turn
-            set -l agent_status $status
-            if test "$__a_ai_turn_mode" = once
-                return $agent_status
-            end
             set shell_prompt_rows 1
         else if test "$__a_ai_turn_mode" = once
             commandline -f repaint

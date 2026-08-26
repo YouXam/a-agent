@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -12,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 use crate::agent::{Agent, ContextStatus};
 use crate::config::{Config, ModelSelection};
 use crate::context::{
-    ContextInput, build_system_prompt, discover_agents_for_targets, discover_skills,
+    ContextInput, build_system_prompt, discover_agents_for_targets, discover_skills, skill_roots,
 };
 use crate::fish;
 use crate::model::ContentBlock;
@@ -88,19 +89,18 @@ pub async fn run() -> Result<i32> {
         .ancestors()
         .find(|path| path.join(".git").exists())
         .unwrap_or(&cwd);
-    let skills = discover_skills(
-        &home.join(".config/a/skills"),
-        &project_root.join(".a/skills"),
-    )?;
+    let skills = discover_skills(&skill_roots(&home, project_root))?;
     timing.mark("skills_index");
     let mut system_prompt = build_system_prompt(&ContextInput {
         cwd: cwd.clone(),
         agents,
         skills,
-        targeted_files: targets,
         platform: std::env::consts::OS.into(),
         shell: std::env::var("SHELL").unwrap_or_else(|_| "unknown".into()),
     });
+    // Targets belong to the turn that requested them, not to the session's
+    // system prompt, so they are consumed by the first user message.
+    let mut pending_targets = targets;
 
     let mut store = SessionStore::open(&database_path)?;
     timing.mark("sqlite_open");
@@ -207,7 +207,11 @@ pub async fn run() -> Result<i32> {
                 } else {
                     renderer.render_user(prompt)?;
                 }
-                let contextual = contextual_prompt(prompt, stdin_context.as_deref());
+                let contextual = contextual_prompt(
+                    prompt,
+                    stdin_context.as_deref(),
+                    &std::mem::take(&mut pending_targets),
+                );
                 if run_turn(&agent, &renderer, &contextual).await? && args.one_turn {
                     return Ok(130);
                 }
@@ -278,7 +282,8 @@ pub async fn run() -> Result<i32> {
                     SlashAction::Handled => {}
                     SlashAction::NotCommand => {
                         renderer.begin_turn()?;
-                        let contextual = contextual_prompt(&prompt, None);
+                        let contextual =
+                            contextual_prompt(&prompt, None, &std::mem::take(&mut pending_targets));
                         let cancelled = run_turn(&agent, &renderer, &contextual).await?;
                         if mode == InputMode::Once {
                             return Ok(if cancelled { 130 } else { 0 });
@@ -921,8 +926,15 @@ fn append_shell_context(system_prompt: &mut String, shell: &[ShellHistoryItem]) 
     }
 }
 
-fn contextual_prompt(prompt: &str, stdin: Option<&str>) -> String {
+fn contextual_prompt(prompt: &str, stdin: Option<&str>, targets: &[PathBuf]) -> String {
     let mut sections = Vec::new();
+    if !targets.is_empty() {
+        let mut section = String::from("Files provided with this request:\n");
+        for path in targets {
+            let _ = writeln!(section, "- {}", path.display());
+        }
+        sections.push(section.trim_end().to_owned());
+    }
     if let Some(stdin) = stdin {
         sections.push(format!("User-provided stdin:\n\n{stdin}"));
     }

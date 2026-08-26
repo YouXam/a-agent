@@ -85,6 +85,22 @@ fn transcript_is_append_only_aligned_and_colored() {
                 .any(|window| window == forbidden)
         );
     }
+    // Palette entries 7 and 9-15 are white or bright, so they wash out on a
+    // light background. Message text keeps the terminal's own foreground (39)
+    // and accents use 1-6 plus 8, which stay legible against either background.
+    for index in [7, 9, 10, 11, 12, 13, 14, 15] {
+        let forbidden = format!("\x1b[38;5;{index}m");
+        assert!(
+            !bytes
+                .windows(forbidden.len())
+                .any(|window| window == forbidden.as_bytes()),
+            "palette index {index} is unreadable on a light background"
+        );
+    }
+    assert!(
+        bytes.windows(5).any(|window| window == b"\x1b[39m"),
+        "message text should keep the terminal's default foreground"
+    );
 }
 
 #[test]
@@ -549,11 +565,20 @@ async fn new_fish_has_immediate_ai_prompt_without_shell_completion_and_invokes_a
     assert!(calls.contains("--one-turn|prompt=echo ok|"), "{calls:?}");
     assert!(!pane.contains("a --fish-ai"), "{pane:?}");
     assert!(pane.contains("agent invoked"), "{pane:?}");
-    let final_pane = wait_for_last_line(&socket, session, |line| line.contains("[1]#")).await;
+    // The agent's own exit code reaches the shell, so the prompt no longer
+    // reports the status of whatever ran before Ctrl+G.
+    let final_pane = wait_for_last_line(&socket, session, |line| line.contains("[0]#")).await;
     assert!(
-        last_visible_line(&final_pane).contains("[1]#"),
+        last_visible_line(&final_pane).contains("[0]#"),
         "{final_pane:?}"
     );
+    assert!(!final_pane.contains("__a_ai_turn"), "{final_pane:?}");
+    // Up must still reach the user's own last shell command, not the internal
+    // command that carried the agent's exit code.
+    tmux_key(&socket, session, "Up").await;
+    let recalled = wait_for_last_line(&socket, session, |line| line.ends_with("false")).await;
+    assert!(!recalled.contains("__a_ai_turn"), "{recalled:?}");
+    tmux_key(&socket, session, "C-u").await;
     let _ = Command::new("tmux")
         .args(["-L", &socket, "kill-server"])
         .status()

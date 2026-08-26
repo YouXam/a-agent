@@ -1,37 +1,98 @@
 # a-agent
 
-`a` is a fast, single-process terminal coding agent written in Rust.
+`a` is a fast, single-process terminal coding agent written in Rust, for people
+who already live in a shell.
 
-Its core stays intentionally small:
+It stays at your prompt, leaves your scrollback intact, and already carries the
+context your shell just produced. In Fish, `Ctrl+G` turns the current prompt
+into an `a> ` prompt:
 
-- three tools: `read`, `apply_patch`, and `bash`
-- no repository indexing, daemon, PTY wrapper, LSP, or background watcher
-- progressive loading for file targets and Skills
-- an append-only colored transcript with a Rustyline prompt
-- resumable, branchable SQLite conversations
-- Anthropic Messages, OpenAI Responses, and OpenAI-compatible Chat Completions
+```text
+❯ cargo test
+test drops_punctuation ... FAILED
+…
+error: test failed, to rerun pass `--test slug`
 
-## Build
+a> fix this                                                         once · tab
+▸ Reasoning
+✓ read  /tmp/demo/src/lib.rs · 3 lines
+  │ 1: pub fn slug(title: &str) -> String {
+  │ 2:     title.to_lowercase().replace(' ', "-")
+  │ 3: }
+│ The test expects punctuation to be dropped. The current `slug` only replaces
+ spaces with hyphens, so `"Hello, World"` becomes `"hello,-world"` instead of
+`"hello-world"`.
+✓ apply_patch  1 files  +6 -5
+  M /tmp/demo/src/lib.rs
+✓ bash  exit 0
+  $ cd /tmp/demo && cargo test
+  │ running 1 test
+  … output truncated
+│ Fixed. The test now passes.
+❯
+```
 
-Rust 1.95 or newer is required.
+Excerpt of a real session; some tool calls are omitted. `a` inherited the
+failing command, its exit status, and the directory from the shell — nothing
+was pasted in.
+
+It is also a plain CLI, usable from any shell:
+
+```bash
+a                                          # interactive
+a "fix the parser test"
+a -1 "update the version and run tests"    # exit after one turn
+a src/parser.rs "simplify this"            # targets are paths, not contents
+cargo test 2>&1 | a "fix this failure"     # pipe logs in
+a -r "continue"                            # resume this directory's session
+```
+
+## Install
 
 ```bash
 cargo install a-agent
-# Or install the current checkout:
+```
+
+Rust 1.95 or newer is required. The installed binary is named `a`. Then install
+the shell integration:
+
+```bash
+a --install-fish
+```
+
+To build from a checkout instead:
+
+```bash
 cargo build --release
 cargo install --path .
 ```
 
-The installed binary is named `a`.
+The agent runs in any terminal and any shell. The `Ctrl+G` prompt, the
+command-history context, and the per-shell conversations target Fish.
+
+## Why a-agent
+
+- **Shell-native.** `Ctrl+G` enters and leaves AI input on the same Fish prompt
+  line, and each Fish process gets its own conversation per directory.
+- **It knows what you just ran.** Fish hooks record command, cwd, exit status,
+  and duration — never output — and the runtime injects the recent ones.
+- **Append-only output.** No viewport, alternate screen, or repainted history;
+  your scrollback stays scrollable and copyable.
+- **No indexing, no daemon.** Startup does not scale with repository size;
+  resuming a 100-turn conversation reaches the first request in about 15 ms.
+- **Three tools.** `read`, `apply_patch`, `bash`. Independent calls run in
+  parallel; patches touching the same file are serialized.
+- **Resumable and reversible.** SQLite sessions, `Esc` to rewind to an earlier
+  message, compaction anchored on the token usage the provider reported.
+- **Any provider.** Anthropic Messages, OpenAI Responses, and OpenAI-compatible
+  Chat Completions, with third-party base URLs and headers as configuration.
 
 ## Configure
 
-On the first agent run, `a` creates `~/.config/a/config.toml` from
-[`config.example.toml`](config.example.toml) and prints its path. The default
-Responses settings are active. Configuration uses named provider and model
-profiles; the legacy singular `[provider]` table is not supported.
-
-One provider can serve multiple independently configured models:
+The first agent run creates `~/.config/a/config.toml` from
+[`config.example.toml`](config.example.toml) and prints its path. Configuration
+uses named provider and model profiles; one provider can serve several
+independently configured models.
 
 ```toml
 default_model = "codex"
@@ -55,36 +116,12 @@ effort = "low"
 efforts = ["none", "low", "medium"]
 ```
 
-An API key can also be stored directly. A non-empty `api_key` takes precedence
-over `api_key_env`:
+`type` is `responses`, `anthropic`, or `chatcompletion`. A provider may set
+`api_key` directly, which takes precedence over `api_key_env` at the cost of
+storing the secret in plaintext. Anthropic's SDK appends `/v1`, so configure an
+origin for it; OpenAI-protocol base URLs normally include `/v1`.
 
-```toml
-[providers.openai]
-api_key = "sk-..."
-```
-
-This is convenient but stores the secret as plaintext. Keep the file private
-and out of version control; environment variables remain the safer default.
-
-Anthropic Messages:
-
-```toml
-[providers.anthropic]
-type = "anthropic"
-base_url = "https://api.anthropic.com"
-api_key_env = "ANTHROPIC_API_KEY"
-
-[models.claude]
-provider = "anthropic"
-model = "your-claude-model"
-effort = "high"
-efforts = ["low", "medium", "high", "max"]
-```
-
-Anthropic's Rust SDK appends `/v1`; configure an origin rather than a `/v1`
-endpoint. OpenAI protocol base URLs should normally include `/v1`.
-
-OpenAI-compatible Chat Completions:
+Third-party gateways can extend requests:
 
 ```toml
 [providers.gateway]
@@ -97,47 +134,28 @@ X-Tenant = "acme"
 
 [providers.gateway.request]
 service_tier = "priority"
-
-[models.gateway]
-provider = "gateway"
-model = "provider-model-id"
-effort = "medium"
-efforts = ["low", "medium", "high"]
 ```
 
-Provider profiles own endpoints and authentication. Model profiles own the
-model ID, effort choices, context window, token limit, and optional
-header/request overrides.
-When set, `context_window` must be greater than the model's effective
-`max_tokens` value.
-No provider discovery or capability probe is performed. Only the selected
-provider is initialized.
-
-Project-local `.a/config.toml` values override the global config.
+Provider profiles own endpoints and authentication; model profiles own the model
+ID, effort choices, `context_window`, `max_tokens`, and optional header or
+request overrides. `context_window` must exceed `max_tokens`. Nothing is probed
+at startup, and only the selected provider is initialized. Terminal display
+limits live under `[ui]`. Project-local `.a/config.toml` overrides the global
+file.
 
 ## Use
 
 ```bash
-a
-a "fix the parser test"
-a -1 "update the version and run tests"
-a src/parser.rs "simplify this"
 a src/a.rs src/b.rs "remove duplication"
-cargo test 2>&1 | a "fix this failure"
 a -r
 a -r -1 "continue"
 a --session a_SESSION_ID "continue"
 ```
 
-`-1` exits after one complete logical user turn, including all model/tool
-cycles. Target files are sent as paths; their contents are read only if the
-model calls `read`. Piped stdin is bounded and keeps the tail, which is useful
-for compiler and test logs.
-
-Interactive `a` defaults to multi-turn mode. `Tab` switches the right prompt
-between `multi · tab` and `once · tab`; once mode exits after the current
-response. Input history is stored in SQLite and shared across interactive
-a-agent sessions. Fish keeps its own existing history behavior.
+`-1` exits after one complete user turn, including all model and tool cycles.
+Target files are sent as paths and read only if the model calls `read`. Piped
+stdin is bounded and keeps the tail. Interactive `a` defaults to multi-turn
+mode; `Tab` switches between `multi · tab` and `once · tab`.
 
 Interactive commands:
 
@@ -152,169 +170,80 @@ Interactive commands:
 /help
 ```
 
-Without an argument, `/model` and `/effort` open an arrow-key selector. Typing
-`/` opens a live-filtered command palette below the input. Use `Up`/`Down` to
-select a command, then `Tab` to complete it or `Enter` to run it immediately.
-Each row shows the command's parameters and purpose. `/thinking` toggles
-reasoning visibility, like `Ctrl+O`, and
-reports the new state. Model profile and effort changes are persisted with the
-session and restored by resume. `/resume` opens a current-directory session
-selector when no ID is given; entries are labeled with their first user prompt.
-Resuming a session prints a divider and replays its active history before new
-input. Sessions from another cwd are rejected. In Fish, selecting a session
-also rebinds that Fish process so later `Ctrl+G` turns continue the selected
-conversation.
-`/compact` immediately summarizes the active branch; automatic compaction uses
-the same path.
+Typing `/` lists them. `/model`, `/effort`, and `/resume` open a selector when
+given no argument. Model, effort, and reasoning visibility persist with the
+session and are restored on resume. `/resume` only offers sessions from the
+current directory.
 
-`/status` reports the active model and effort plus context usage. It
-distinguishes the latest provider-reported token anchor from locally estimated
-trailing messages, and shows the context window and automatic-compaction
-threshold when configured.
-
-When a model profile sets `context_window`, automatic compaction triggers near
-`context_window - max_tokens`. Context usage is anchored to the latest valid
-token count returned by the provider. OpenAI cached input is normalized into
-separate cache-read/cache-write fields; `total_tokens` is preferred when the
-provider returns it. Only messages added after the usage anchor use a small
-characters-per-token estimate. Compaction does not add a token-count API
-request to each turn, and compaction summary requests do not expose tools.
+When a model profile sets `context_window`, `a` compacts automatically near
+`context_window - max_tokens`. Usage comes from the token counts the provider
+reports, so no extra API call is made; only messages newer than the last report
+are estimated locally.
 
 ## Context
 
-Active `AGENTS.md` files are loaded along the current/target path ancestry,
-from broad scope to specific scope. The optional global file is:
+Active `AGENTS.md` files are loaded along the current/target path ancestry, from
+broad scope to specific scope. The optional global file is:
 
 ```text
 ~/.config/a/AGENTS.md
 ```
 
-Skills are discovered only in direct child directories:
+Skills use the [Agent Skills](https://agentskills.io) format: a directory whose
+`SKILL.md` carries `name` and `description` in YAML frontmatter, plus any
+bundled `scripts/`, `references/`, or `assets/`. Only the shared convention is
+scanned, so skills installed by any compliant client are visible here and vice
+versa:
 
 ```text
-~/.config/a/skills/<name>/SKILL.md
-<project>/.a/skills/<name>/SKILL.md
+~/.agents/skills/<name>/SKILL.md
+<project>/.agents/skills/<name>/SKILL.md
 ```
 
-Only Skill `name`, `description`, and path are loaded during startup. The model
-must use `read` to load a relevant Skill body.
+Direct child directories of those two locations are scanned. A project skill
+takes precedence over a user skill of the same name.
 
-## Sessions And Rewind
+Only `name`, `description`, and the path are loaded at startup; the model
+`read`s the body when a task matches. A skill missing a description is skipped
+with a warning, and a name that disagrees with its directory is warned about but
+still loaded.
 
-Sessions are stored in `$XDG_STATE_HOME/a/sessions.db`, or
-`~/.local/state/a/sessions.db` when `XDG_STATE_HOME` is unset. SQLite uses WAL,
-normal synchronous mode, foreign keys, and semantic write boundaries.
-An interrupted turn records an internal notice so a later resume does not
-silently continue the cancelled task.
+## Sessions
 
-In interactive mode, press `Esc` to select a previous user checkpoint. A
-second `Esc` triggers it immediately instead of waiting for the terminal's
-500 ms escape-sequence timeout. Rewind moves the session HEAD; it does not
-delete the old branch. The picker uses `Up`/`Down`, `Enter`, and `Esc`, and
-includes persisted user checkpoints from before compaction.
+Sessions live in `$XDG_STATE_HOME/a/sessions.db`, or
+`~/.local/state/a/sessions.db` when `XDG_STATE_HOME` is unset. Resuming replays
+the history it is about to continue. Cancelling a turn records an explicit
+notice, so a later resume does not silently continue the cancelled task.
 
-Default controls:
-
-- `Esc` / `Esc Esc`: rewind picker
-- `Ctrl+O`: toggle reasoning visibility
-- `Esc` or `Ctrl+C` during a turn: cancel the active turn
+- `Esc`: rewind to an earlier message of yours; the old branch is kept
+- `Esc` or `Ctrl+C` during a turn: cancel it
+- `Ctrl+O`: toggle reasoning visibility, configurable as
+  `ui.reasoning_toggle = "ctrl-r"`
 - `Ctrl+C` at the prompt: exit
-- `Up` / `Down`: input or picker history
-
-The reasoning key is configurable with `ui.reasoning_toggle = "ctrl-r"`.
-User, assistant, reasoning, running tools, successful tools, and errors use
-distinct semantic colors. Every line is written once to normal terminal
-scrollback: there is no viewport, content redraw, history overwrite, or
-alternate screen.
-
-Tool calls use domain-specific, bounded output: Bash shows `$` commands and a
-live output tail, `read` shows the path/range and a numbered preview, and
-`apply_patch` shows A/M/D file operations plus diff statistics. Unknown tools
-fall back to labeled input/output blocks. Configure display limits with
-`ui.tool_input_max_bytes`, `ui.tool_output_max_bytes`, and
-`ui.tool_output_max_lines`.
-`apply_patch` updates existing files in place so permissions, ownership, hard
-links, ACLs, and extended attributes remain attached to the same inode. New
-files use the process's normal umask.
-The transient parallel-tool panel keeps the latest
-`ui.tool_live_output_lines` lines per running tool.
-A transient spinner remains below the currently streamed reasoning or assistant
-line throughout model generation. Completed lines are appended to scrollback
-immediately; only the unfinished line is redrawn. The spinner disappears when
-generation completes and never enters scrollback.
 
 ## Fish
 
-Install Fish hooks and the AI-mode binding:
+`a --install-fish` writes `~/.config/fish/conf.d/a.fish`. Restart Fish, or
+source that file in an already-running shell.
 
-```bash
-a --install-fish
-```
+`Ctrl+G` opens the `a> ` prompt. `Ctrl+G` again returns your text to the normal
+Fish editor on the same line; `Ctrl+C` cancels the line. `Tab` switches between
+`once · tab` and `multi · tab`, and the choice lasts for the life of that Fish
+process.
 
-Restart Fish, or source `~/.config/fish/conf.d/a.fish`. `Ctrl+G` opens the
-dedicated `a> ` input prompt. It deliberately does not enable Fish `--shell`
-mode, so shell syntax highlighting and autosuggestions do not apply. The right
-prompt shows `once · tab` by default; press `Tab` to switch to `multi · tab`.
-Once mode returns to Fish after one response. Multi mode keeps showing `a> `
-after each response until it is switched back to once or cancelled. The mode
-choice is retained for the lifetime of that Fish process, including across
-`Ctrl+G` and `Ctrl+C` exits from AI input.
-Press `Ctrl+G` again to restore the current text to the normal Fish editor on
-the same line. Press `Ctrl+C` to cancel the AI input line and open a fresh Fish
-prompt.
+Each Fish process has its own conversation per directory, so two panes in one
+repository do not collide. `a --resume` picks up a directory's latest
+conversation regardless of which shell created it.
 
-Each Fish process has an isolated conversation for each cwd. Opening another
-Fish process in the same directory starts a separate conversation. Use
-`a --resume` explicitly to resume the latest conversation for a cwd regardless
-of which Fish process created it.
-
-The Fish hooks record command, cwd, exit status, pipe status, start time, and
-duration. They never capture stdout or stderr. The Rust runtime injects recent
-command records from that Fish process and cwd into the request's system
-context.
+The hooks record command, cwd, exit status, pipe status, and duration — never
+stdout or stderr — and the runtime injects the recent ones from that shell and
+directory into the request's system context.
 
 ## Security
 
-`read`, `apply_patch`, and `bash` can access paths outside the cwd and run with
-the current user's permissions; none is sandboxed. API keys are read from the
-selected provider profile or its configured environment variable and are never
-persisted in SQLite.
-
-## Validate
-
-```bash
-cargo test --all-targets
-cargo clippy --all-targets -- -D warnings
-cargo fmt --all -- --check
-cargo build --release
-```
-
-Set `A_DEBUG_TIMING=1` to print startup phase timings before the first model
-request.
-
-Resume startup can be benchmarked against a local mock provider. The final
-argument is the number of turns preloaded into the baseline session:
-
-```bash
-node scripts/bench-resume.mjs target/release/a 100 1
-node scripts/bench-resume.mjs target/release/a 50 100
-```
-
-## Release
-
-Releases are published to crates.io by
-[`.github/workflows/publish.yml`](.github/workflows/publish.yml). Authentication
-uses crates.io Trusted Publishing over GitHub OIDC, so no registry token is
-stored in the repository.
-
-Pushing a `v<version>` tag runs the release job. The tag must match the version
-in `Cargo.toml`, and formatting, Clippy, the full test suite, and
-`cargo publish --dry-run` must pass before the upload. If the version is already
-on crates.io, the upload is skipped instead of failing, so a run can be safely
-repeated. The workflow can also be started manually with `workflow_dispatch`,
-which skips only the tag check.
-
-```bash
-git tag -a v0.1.0 -m 'a-agent 0.1.0'
-git push origin v0.1.0
-```
+`read`, `apply_patch`, and `bash` run with your permissions and are not
+sandboxed; they can reach paths outside the cwd. `apply_patch` updates existing
+files in place, so permissions, ownership, hard links, ACLs, and extended
+attributes stay attached to the same inode; new files use your normal umask. API
+keys come from the selected provider profile or its environment variable and are
+never written to SQLite.

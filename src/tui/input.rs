@@ -55,39 +55,72 @@ struct PaletteState(Mutex<PaletteSelection>);
 #[derive(Default)]
 struct PaletteSelection {
     prefix: String,
+    from: Option<String>,
+    applied: Option<String>,
     index: usize,
 }
 
 impl PaletteState {
-    fn selected(&self, prefix: &str, count: usize) -> usize {
+    /// Returns the prefix the palette filters on. Navigation writes the
+    /// highlighted command into the input, so the buffer alone cannot be the
+    /// filter: once it holds a command name the list would collapse to that one
+    /// entry. The prefix the user typed is kept while the buffer holds either
+    /// side of a completion this palette requested, and is refreshed as soon as
+    /// the user edits the line themselves.
+    fn filter_prefix(&self, line: &str) -> String {
+        let Ok(mut state) = self.0.lock() else {
+            return line.to_owned();
+        };
+        let ours = state.applied.as_deref() == Some(line) || state.from.as_deref() == Some(line);
+        if state.applied.is_some() && ours {
+            return state.prefix.clone();
+        }
+        if state.prefix != line {
+            state.prefix = line.into();
+            state.index = 0;
+        }
+        state.from = None;
+        state.applied = None;
+        state.prefix.clone()
+    }
+
+    fn selected(&self, count: usize) -> usize {
         let Ok(mut state) = self.0.lock() else {
             return 0;
         };
-        if state.prefix != prefix {
-            state.prefix = prefix.into();
-            state.index = 0;
-        }
         state.index = state.index.min(count.saturating_sub(1));
         state.index
     }
 
-    fn move_selection(&self, prefix: &str, count: usize, direction: isize) {
+    fn move_selection(&self, count: usize, direction: isize) -> usize {
         if count == 0 {
-            return;
+            return 0;
         }
         let Ok(mut state) = self.0.lock() else {
-            return;
+            return 0;
         };
-        if state.prefix != prefix {
-            state.prefix = prefix.into();
-            state.index = 0;
-        }
         state.index = (state.index as isize + direction).rem_euclid(count as isize) as usize;
+        state.index
+    }
+
+    fn request_completion(&self, from: &str, to: &str) {
+        if let Ok(mut state) = self.0.lock() {
+            state.from = Some(from.to_owned());
+            state.applied = Some(to.to_owned());
+        }
+    }
+
+    /// The text a handler asked to complete to. Read only, so the completer
+    /// cannot disturb the selection it is being asked to render.
+    fn pending_completion(&self) -> Option<String> {
+        self.0.lock().ok()?.applied.clone()
     }
 
     fn clear(&self) {
         if let Ok(mut state) = self.0.lock() {
             state.prefix.clear();
+            state.from = None;
+            state.applied = None;
             state.index = 0;
         }
     }
@@ -127,7 +160,7 @@ fn command_row(command: &SlashCommand, selected: bool, color: bool) -> String {
         return row;
     }
     if selected {
-        format!("\x1b[1;96m{row}\x1b[0m")
+        format!("\x1b[1;36m{row}\x1b[0m")
     } else {
         format!("\x1b[90m{row}\x1b[0m")
     }
@@ -163,16 +196,15 @@ impl Completer for AgentHelper {
         position: usize,
         _context: &Context<'_>,
     ) -> rustyline::Result<(usize, Vec<Self::Candidate>)> {
-        let Some(prefix) = command_prefix(line, position) else {
+        if command_prefix(line, position).is_none() {
             return Ok((0, Vec::new()));
-        };
-        let commands = matching_commands(prefix);
-        let selected = self.palette.selected(prefix, commands.len());
-        let candidates = commands
-            .get(selected)
-            .map(|command| Pair {
-                display: command.usage.into(),
-                replacement: format!("{} ", command.name),
+        }
+        let candidates = self
+            .palette
+            .pending_completion()
+            .map(|target| Pair {
+                display: target.clone(),
+                replacement: target,
             })
             .into_iter()
             .collect();
@@ -188,9 +220,10 @@ impl Hinter for AgentHelper {
             self.palette.clear();
             return None;
         }
-        if let Some(prefix) = command_prefix(line, position) {
-            let commands = matching_commands(prefix);
-            let selected = self.palette.selected(prefix, commands.len());
+        if let Some(current) = command_prefix(line, position) {
+            let prefix = self.palette.filter_prefix(current);
+            let commands = matching_commands(&prefix);
+            let selected = self.palette.selected(commands.len());
             let color = std::env::var_os("NO_COLOR").is_none();
             let rows = commands
                 .iter()
@@ -224,7 +257,7 @@ impl Highlighter for AgentHelper {
             return Cow::Borrowed(hint);
         }
         if self.multi.load(Ordering::SeqCst) {
-            Cow::Owned(format!("\x1b[1;95m{hint}\x1b[0m"))
+            Cow::Owned(format!("\x1b[1;35m{hint}\x1b[0m"))
         } else {
             Cow::Owned(format!("\x1b[90m{hint}\x1b[0m"))
         }
@@ -281,13 +314,46 @@ impl ConditionalEventHandler for TabHandler {
         _positive: bool,
         context: &EventContext,
     ) -> Option<Cmd> {
-        if let Some(prefix) = command_prefix(context.line(), context.pos()) {
-            let commands = matching_commands(prefix);
-            self.palette.selected(prefix, commands.len());
+        if let Some(current) = command_prefix(context.line(), context.pos()) {
+            let prefix = self.palette.filter_prefix(current);
+            let commands = matching_commands(&prefix);
+            let selected = self.palette.selected(commands.len());
+            if let Some(command) = commands.get(selected) {
+                self.palette.request_completion(current, command.name);
+            }
             return Some(Cmd::Complete);
         }
         self.multi.fetch_xor(true, Ordering::SeqCst);
         Some(Cmd::Repaint)
+    }
+}
+
+/// Rustyline maps one key press to one command, so Enter cannot both rewrite the
+/// buffer and submit it. When the input still holds the prefix the user typed,
+/// Enter completes it to the highlighted command instead of submitting, so the
+/// transcript never records a line that differs from the command that ran.
+struct PaletteSubmit {
+    palette: Arc<PaletteState>,
+}
+
+impl ConditionalEventHandler for PaletteSubmit {
+    fn handle(
+        &self,
+        _event: &Event,
+        _repeat: RepeatCount,
+        _positive: bool,
+        context: &EventContext,
+    ) -> Option<Cmd> {
+        let current = command_prefix(context.line(), context.pos())?;
+        let prefix = self.palette.filter_prefix(current);
+        let commands = matching_commands(&prefix);
+        let selected = self.palette.selected(commands.len());
+        let command = commands.get(selected)?;
+        if command.name == current {
+            return None;
+        }
+        self.palette.request_completion(current, command.name);
+        Some(Cmd::Complete)
     }
 }
 
@@ -304,10 +370,13 @@ impl ConditionalEventHandler for PaletteNavigation {
         _positive: bool,
         context: &EventContext,
     ) -> Option<Cmd> {
-        let prefix = command_prefix(context.line(), context.pos())?;
-        let count = matching_commands(prefix).len();
-        self.palette.move_selection(prefix, count, self.direction);
-        Some(Cmd::Repaint)
+        let current = command_prefix(context.line(), context.pos())?;
+        let prefix = self.palette.filter_prefix(current);
+        let commands = matching_commands(&prefix);
+        let selected = self.palette.move_selection(commands.len(), self.direction);
+        let command = commands.get(selected)?;
+        self.palette.request_completion(current, command.name);
+        Some(Cmd::Complete)
     }
 }
 
@@ -318,7 +387,6 @@ pub struct InputEditor {
     pending_initial: Option<(String, String)>,
     reasoning_key: char,
     multi: Arc<AtomicBool>,
-    palette: Arc<PaletteState>,
 }
 
 impl InputEditor {
@@ -342,6 +410,10 @@ impl InputEditor {
         let palette = Arc::new(PaletteState::default());
         let editor_config = rustyline::Config::builder()
             .keyseq_timeout(Some(500))
+            // Circular completion runs its own key loop, which swallows the next
+            // arrow press and restores the pre-completion buffer. List applies a
+            // single candidate and returns immediately.
+            .completion_type(rustyline::CompletionType::List)
             .build();
         let mut editor = Editor::<AgentHelper, DefaultHistory>::with_config(editor_config)
             .map_err(io::Error::other)?;
@@ -373,6 +445,12 @@ impl InputEditor {
             })),
         );
         editor.bind_sequence(
+            KeyEvent(KeyCode::Enter, Modifiers::NONE),
+            EventHandler::Conditional(Box::new(PaletteSubmit {
+                palette: palette.clone(),
+            })),
+        );
+        editor.bind_sequence(
             KeyEvent(KeyCode::Up, Modifiers::NONE),
             EventHandler::Conditional(Box::new(PaletteNavigation {
                 palette: palette.clone(),
@@ -393,7 +471,6 @@ impl InputEditor {
             pending_initial: None,
             reasoning_key,
             multi,
-            palette,
         })
     }
 
@@ -411,7 +488,7 @@ impl InputEditor {
     }
 
     pub fn read_action(&mut self) -> io::Result<InputAction> {
-        let prompt = ("a> ", "\x1b[1;96ma> \x1b[0m");
+        let prompt = ("a> ", "\x1b[1;36ma> \x1b[0m");
         let result = if let Some((left, right)) = self.pending_initial.take() {
             self.editor.readline_with_initial(&prompt, (&left, &right))
         } else {
@@ -419,7 +496,6 @@ impl InputEditor {
         };
         match result {
             Ok(line) => {
-                let line = self.accept_palette_selection(line);
                 if !line.trim().is_empty() {
                     self.editor
                         .add_history_entry(line.as_str())
@@ -444,17 +520,6 @@ impl InputEditor {
             Err(ReadlineError::Eof) => Ok(InputAction::Eof),
             Err(error) => Err(io::Error::other(error)),
         }
-    }
-
-    fn accept_palette_selection(&self, line: String) -> String {
-        let Some(prefix) = command_prefix(&line, line.len()) else {
-            return line;
-        };
-        let commands = matching_commands(prefix);
-        let selected = self.palette.selected(prefix, commands.len());
-        commands
-            .get(selected)
-            .map_or(line, |command| command.name.into())
     }
 
     pub fn add_history_entries(&mut self, entries: &[String]) -> io::Result<()> {

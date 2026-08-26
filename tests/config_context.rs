@@ -4,7 +4,7 @@ use std::path::Path;
 use a_agent::config::{Config, ProviderKind};
 use a_agent::context::{
     ContextInput, SkillMetadata, bound_stdin, build_system_prompt, discover_agents,
-    discover_skills, parse_skill_metadata,
+    discover_skills, parse_skill_metadata, skill_roots,
 };
 use tempfile::tempdir;
 
@@ -207,26 +207,126 @@ fn skill_frontmatter_is_parsed_without_loading_the_body() {
 }
 
 #[test]
-fn project_skill_overrides_global_skill_metadata() {
+fn skill_roots_follow_the_agent_skills_conventions() {
+    let home = Path::new("/home/user");
+    let project = Path::new("/repo");
+    let roots = skill_roots(home, project);
+    let shown = roots
+        .iter()
+        .map(|root| root.display().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        shown,
+        vec!["/home/user/.agents/skills", "/repo/.agents/skills"],
+        "only the shared convention is scanned, user scope first so project wins"
+    );
+}
+
+#[test]
+fn project_skill_overrides_user_skill_metadata() {
     let temp = tempdir().unwrap();
-    let global = temp.path().join("global");
-    let project = temp.path().join("repo/.a/skills");
-    fs::create_dir_all(global.join("review")).unwrap();
-    fs::create_dir_all(project.join("review")).unwrap();
+    let home = temp.path().join("home");
+    let project = temp.path().join("repo");
+    let user_root = home.join(".agents/skills/review");
+    let project_root = project.join(".agents/skills/review");
+    fs::create_dir_all(&user_root).unwrap();
+    fs::create_dir_all(&project_root).unwrap();
     fs::write(
-        global.join("review/SKILL.md"),
-        "---\nname: review\ndescription: global\n---\nbody",
+        user_root.join("SKILL.md"),
+        "---\nname: review\ndescription: user\n---\nbody",
     )
     .unwrap();
     fs::write(
-        project.join("review/SKILL.md"),
+        project_root.join("SKILL.md"),
         "---\nname: review\ndescription: project\n---\nbody",
     )
     .unwrap();
 
-    let skills = discover_skills(&global, &project).unwrap();
+    let skills = discover_skills(&skill_roots(&home, &project)).unwrap();
     assert_eq!(skills.len(), 1);
     assert_eq!(skills[0].description, "project");
+}
+
+#[test]
+fn user_and_project_skills_are_merged_and_client_directories_are_ignored() {
+    let temp = tempdir().unwrap();
+    let home = temp.path().join("home");
+    let project = temp.path().join("repo");
+    for (root, name) in [
+        (home.join(".agents/skills/shared-user"), "shared-user"),
+        (
+            project.join(".agents/skills/shared-project"),
+            "shared-project",
+        ),
+        (home.join(".claude/skills/claude-user"), "claude-user"),
+        (project.join(".a/skills/native-project"), "native-project"),
+    ] {
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: {name} description\n---\nbody"),
+        )
+        .unwrap();
+    }
+
+    let skills = discover_skills(&skill_roots(&home, &project)).unwrap();
+    let names = skills
+        .iter()
+        .map(|skill| skill.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, vec!["shared-project", "shared-user"], "{skills:?}");
+}
+
+#[test]
+fn skill_metadata_follows_the_specification() {
+    // A nested metadata map must not be mistaken for the top-level name, and a
+    // block scalar description has to survive as one line of text.
+    let source = concat!(
+        "---\n",
+        "name: pdf-processing\n",
+        "description: >-\n",
+        "  Extract PDF text, fill forms, merge files.\n",
+        "  Use when handling PDFs.\n",
+        "license: Apache-2.0\n",
+        "metadata:\n",
+        "  name: not-the-skill-name\n",
+        "  version: \"1.0\"\n",
+        "---\n",
+        "SECRET BODY"
+    );
+    let parsed =
+        parse_skill_metadata(source, Path::new("/skills/pdf-processing/SKILL.md")).unwrap();
+    assert_eq!(parsed.name, "pdf-processing");
+    assert_eq!(
+        parsed.description,
+        "Extract PDF text, fill forms, merge files. Use when handling PDFs."
+    );
+    assert!(!parsed.description.contains("SECRET"));
+}
+
+#[test]
+fn unquoted_colons_in_a_description_are_tolerated() {
+    let source = "---\nname: review\ndescription: Use this skill when: the user asks\n---\nbody";
+    let parsed = parse_skill_metadata(source, Path::new("/skills/review/SKILL.md")).unwrap();
+    assert_eq!(parsed.description, "Use this skill when: the user asks");
+}
+
+#[test]
+fn a_skill_without_a_description_is_skipped() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().join(".agents/skills");
+    fs::create_dir_all(root.join("broken")).unwrap();
+    fs::create_dir_all(root.join("valid")).unwrap();
+    fs::write(root.join("broken/SKILL.md"), "---\nname: broken\n---\nbody").unwrap();
+    fs::write(
+        root.join("valid/SKILL.md"),
+        "---\nname: valid\ndescription: usable\n---\nbody",
+    )
+    .unwrap();
+
+    let skills = discover_skills(std::slice::from_ref(&root)).unwrap();
+    assert_eq!(skills.len(), 1, "{skills:?}");
+    assert_eq!(skills[0].name, "valid");
 }
 
 #[test]
@@ -281,16 +381,15 @@ fn system_prompt_has_active_rules_and_skill_references_only() {
         skills: vec![SkillMetadata {
             name: "review".into(),
             description: "Review code.".into(),
-            path: Path::new("/repo/.a/skills/review/SKILL.md").to_path_buf(),
+            path: Path::new("/repo/.agents/skills/review/SKILL.md").to_path_buf(),
         }],
-        targeted_files: vec![Path::new("/repo/src/a.rs").to_path_buf()],
         platform: "linux".into(),
         shell: "/bin/fish".into(),
     });
     assert!(prompt.contains("Run tests."));
     assert!(prompt.contains("Review code."));
-    assert!(prompt.contains("/repo/.a/skills/review/SKILL.md"));
-    assert!(prompt.contains("Targeted files:\n- /repo/src/a.rs"));
+    assert!(prompt.contains("/repo/.agents/skills/review/SKILL.md"));
+    assert!(!prompt.contains("Targeted files"));
     assert!(prompt.contains("Relative read and apply_patch paths are resolved from the cwd"));
     assert!(prompt.contains("Before any git command, first confirm that .git exists"));
     assert!(prompt.contains("Never inspect the workspace merely because it is available"));

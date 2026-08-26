@@ -163,9 +163,9 @@ impl InlineRenderer {
                 state.color,
                 "› ",
                 message,
-                Color::Cyan,
+                Color::DarkCyan,
                 true,
-                Color::White,
+                Color::Reset,
             )?;
             state.writer.flush()
         })
@@ -341,7 +341,7 @@ impl InlineRenderer {
                         &mut state.writer,
                         state.color,
                         &format!("× {message}\n"),
-                        Color::Red,
+                        Color::DarkRed,
                         true,
                     )?;
                 }
@@ -456,9 +456,9 @@ impl State {
             self.assistant_buffer.push_str(delta);
             let complete = take_complete_lines(&mut self.assistant_buffer);
             let pending = self.assistant_buffer.clone();
-            self.set_generation_partial("│ ", &pending, Color::Green, Color::White);
+            self.set_generation_partial("│ ", &pending, Color::DarkGreen, Color::Reset);
             if !complete.is_empty() {
-                self.commit_generation_text("│ ", &complete, Color::Green, Color::White)?;
+                self.commit_generation_text("│ ", &complete, Color::DarkGreen, Color::Reset)?;
             }
             return Ok(());
         }
@@ -471,8 +471,8 @@ impl State {
             self.color,
             "│ ",
             delta,
-            Color::Green,
-            Color::White,
+            Color::DarkGreen,
+            Color::Reset,
             &mut self.assistant_at_line_start,
         )
     }
@@ -587,7 +587,7 @@ impl State {
         if let Some(live) = &mut self.live {
             live.set_generation_content(None);
         }
-        self.commit_generation_text("│ ", &pending, Color::Green, Color::White)
+        self.commit_generation_text("│ ", &pending, Color::DarkGreen, Color::Reset)
     }
 
     fn finish_open_lines(&mut self) -> io::Result<()> {
@@ -716,7 +716,11 @@ impl State {
                 || result.output.contains("[bash timed out after "));
         let failed = result.is_error || bash_interrupted || exit_code.is_some_and(|code| code != 0);
         let symbol = if failed { "×" } else { "✓" };
-        let color = if failed { Color::Red } else { Color::Green };
+        let color = if failed {
+            Color::DarkRed
+        } else {
+            Color::DarkGreen
+        };
         let summary = tool_summary(&name, result, exit_code);
         self.render_tool_input(id, symbol, color, &summary)?;
         let output = match self.tools.get(id) {
@@ -749,9 +753,9 @@ impl State {
         };
         match name.as_str() {
             "bash" => render_bash_output(&mut self.writer, self.color, &output)?,
-            "read" => render_direct_output(&mut self.writer, self.color, &output, Color::Grey)?,
+            "read" => render_direct_output(&mut self.writer, self.color, &output, Color::Reset)?,
             "apply_patch" if result.is_error => {
-                render_direct_output(&mut self.writer, self.color, &output, Color::Red)?
+                render_direct_output(&mut self.writer, self.color, &output, Color::DarkRed)?
             }
             "apply_patch" => {}
             _ => render_section(
@@ -1160,7 +1164,7 @@ fn write_tool_header(
         writer,
         color_enabled,
         &format!("● {name}"),
-        Color::Yellow,
+        Color::DarkYellow,
         true,
     )?;
     if let Some(detail) = detail.filter(|detail| !detail.is_empty()) {
@@ -1168,7 +1172,7 @@ fn write_tool_header(
             writer,
             color_enabled,
             &format!("  {detail}"),
-            Color::Grey,
+            Color::Reset,
             false,
         )?;
     }
@@ -1227,10 +1231,10 @@ fn render_patch_operations(
     for line in &limited.lines {
         let (operation, path) = line.split_once(' ').unwrap_or(("?", line));
         let color = match operation {
-            "A" => Color::Green,
-            "M" => Color::Yellow,
-            "D" => Color::Red,
-            _ => Color::Grey,
+            "A" => Color::DarkGreen,
+            "M" => Color::DarkYellow,
+            "D" => Color::DarkRed,
+            _ => Color::Reset,
         };
         write_styled(
             writer,
@@ -1243,7 +1247,7 @@ fn render_patch_operations(
             writer,
             color_enabled,
             &format!("{path}\n"),
-            Color::Grey,
+            Color::Reset,
             false,
         )?;
     }
@@ -1333,7 +1337,7 @@ fn render_section(
             writer,
             color_enabled,
             &format!("{line}\n"),
-            Color::Grey,
+            Color::Reset,
             false,
         )?;
     }
@@ -1357,12 +1361,12 @@ fn render_bash_command(
 ) -> io::Result<()> {
     for (index, line) in content.lines.iter().enumerate() {
         let prompt = if index == 0 { "  $ " } else { "  > " };
-        write_styled(writer, color_enabled, prompt, Color::Cyan, true)?;
+        write_styled(writer, color_enabled, prompt, Color::DarkCyan, true)?;
         write_styled(
             writer,
             color_enabled,
             &format!("{line}\n"),
-            Color::White,
+            Color::Reset,
             false,
         )?;
     }
@@ -1403,7 +1407,7 @@ fn render_bash_output(
             writer,
             color_enabled,
             &format!("{line}\n"),
-            Color::Grey,
+            Color::Reset,
             false,
         )?;
     }

@@ -129,6 +129,17 @@ async fn one_turn_cli_persists_and_resumes_without_eager_file_content() {
     assert!(first_body.contains("src/target.rs"));
     assert!(first_body.contains("compiler failed at useful tail"));
     assert!(!first_body.contains("EAGER_CONTENT_MUST_NOT_APPEAR"));
+    let first_json = serde_json::from_str::<serde_json::Value>(&first_body).unwrap();
+    let user_content = first_json["input"][0]["content"].as_str().unwrap();
+    assert!(
+        user_content.contains("src/target.rs"),
+        "targets belong to the user turn: {user_content}"
+    );
+    let instructions = first_json["instructions"].as_str().unwrap();
+    assert!(
+        !instructions.contains("src/target.rs"),
+        "targets must not linger in the system prompt: {instructions}"
+    );
     let second_body = String::from_utf8(requests[1].body.clone()).unwrap();
     assert!(second_body.contains("hello from model"));
     assert!(second_body.contains("continue"));
@@ -757,6 +768,99 @@ async fn first_agent_run_reports_the_generated_config_path() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn targets_without_a_prompt_reach_the_first_interactive_turn() {
+    if Command::new("tmux")
+        .arg("--version")
+        .output()
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let server = MockServer::start().await;
+    let sse = concat!(
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Ready.\"}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+        "data: [DONE]\n\n"
+    );
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse),
+        )
+        .mount(&server)
+        .await;
+
+    let temp = tempdir().unwrap();
+    let home = temp.path().join("home");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(home.join(".config/a")).unwrap();
+    fs::create_dir_all(&repo).unwrap();
+    fs::write(repo.join("notes.txt"), "TARGET_BODY_MUST_NOT_APPEAR").unwrap();
+    fs::write(
+        home.join(".config/a/config.toml"),
+        responses_config(&server.uri()),
+    )
+    .unwrap();
+
+    let socket = format!("a-agent-target-{}", std::process::id());
+    let session = "a-agent-target";
+    let started = Command::new("tmux")
+        .args([
+            "-L",
+            &socket,
+            "new-session",
+            "-d",
+            "-x",
+            "80",
+            "-y",
+            "24",
+            "-s",
+            session,
+            "-c",
+            repo.to_str().unwrap(),
+            "-e",
+            &format!("HOME={}", home.display()),
+            "-e",
+            &format!("XDG_STATE_HOME={}", temp.path().join("state").display()),
+            "-e",
+            "TEST_API_KEY=secret",
+            env!("CARGO_BIN_EXE_a"),
+            "notes.txt",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    wait_for_agent_prompt(&socket, session).await;
+    tmux_send_text(&socket, session, "summarize it").await;
+    tmux_send_key(&socket, session, "Enter").await;
+    wait_for_tmux_text(&socket, session, "Ready.").await;
+
+    let requests = server.received_requests().await.unwrap();
+    let _ = Command::new("tmux")
+        .args(["-L", &socket, "kill-server"])
+        .status()
+        .await;
+    assert_eq!(requests.len(), 1);
+    let body = serde_json::from_slice::<serde_json::Value>(&requests[0].body).unwrap();
+    let content = body["input"][0]["content"].as_str().unwrap();
+    assert!(content.contains("notes.txt"), "{content}");
+    assert!(content.contains("summarize it"), "{content}");
+    assert!(
+        !content.contains("TARGET_BODY_MUST_NOT_APPEAR"),
+        "{content}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn interactive_tui_is_inline_aligned_and_does_not_duplicate_input() {
     if Command::new("tmux")
         .arg("--version")
@@ -838,6 +942,10 @@ async fn interactive_tui_is_inline_aligned_and_does_not_duplicate_input() {
         commands.contains("/resume [session-id]") && commands.contains("Resume a session"),
         "{commands:?}"
     );
+    // Enter on a bare prefix completes the highlighted command first, so the
+    // submitted line is always the command the user can see.
+    tmux_send_key(&socket, session, "Enter").await;
+    wait_for_tmux_text(&socket, session, "a> /model").await;
     tmux_send_key(&socket, session, "Enter").await;
     wait_for_tmux_text(&socket, session, "Model:").await;
     tmux_send_key(&socket, session, "Escape").await;
@@ -845,16 +953,25 @@ async fn interactive_tui_is_inline_aligned_and_does_not_duplicate_input() {
     tmux_send_text(&socket, session, "/").await;
     wait_for_tmux_text(&socket, session, "› /model [profile]").await;
     tmux_send_key(&socket, session, "Down").await;
-    let selected_effort = wait_for_tmux_text(&socket, session, "› /effort [level]").await;
+    // Arrow navigation writes the highlighted command into the input, so the
+    // line that is echoed and submitted is the command that actually runs.
+    let selected_effort = wait_for_tmux_text(&socket, session, "a> /effort").await;
+    assert!(
+        selected_effort.contains("› /effort [level]") && selected_effort.contains("/model"),
+        "the palette stays anchored to the typed prefix: {selected_effort:?}"
+    );
     assert!(
         selected_effort.contains("Set reasoning effort"),
         "{selected_effort:?}"
     );
-    tmux_send_key(&socket, session, "Up").await;
+    tmux_send_key(&socket, session, "Enter").await;
+    wait_for_tmux_text(&socket, session, "Effort:").await;
+    tmux_send_key(&socket, session, "Escape").await;
+    wait_for_agent_prompt(&socket, session).await;
+    tmux_send_text(&socket, session, "/").await;
     wait_for_tmux_text(&socket, session, "› /model [profile]").await;
-    tmux_send_key(&socket, session, "Down").await;
-    tmux_send_key(&socket, session, "Tab").await;
-    wait_for_tmux_text(&socket, session, "a> /effort").await;
+    tmux_send_key(&socket, session, "Up").await;
+    wait_for_tmux_text(&socket, session, "a> /help").await;
     tmux_send_key(&socket, session, "C-u").await;
     tmux_send_text(&socket, session, "/thi").await;
     wait_for_tmux_text(&socket, session, "› /thinking").await;
@@ -1191,14 +1308,24 @@ async fn fresh_fish_records_shell_history_that_reaches_the_agent_request() {
     tmux_send_key(&socket, session, "Enter").await;
     let pane = wait_for_tmux_text(&socket, session, "history received").await;
 
+    wait_for_fish_prompt(&socket, session).await;
+    tmux_send_hex(&socket, session, "07").await;
+    wait_for_tmux_text(&socket, session, "once · tab").await;
+    tmux_send_text(&socket, session, "second turn").await;
+    tmux_send_key(&socket, session, "Enter").await;
+    let pane = wait_for_tmux_text_count(&socket, session, "history received", 2)
+        .await
+        .unwrap_or(pane);
+
     let requests = server.received_requests().await.unwrap();
     let _ = Command::new("tmux")
         .args(["-L", &socket, "kill-server"])
         .status()
         .await;
-    assert_eq!(requests.len(), 1, "{pane:?}");
+    assert_eq!(requests.len(), 2, "{pane:?}");
     assert_eq!(pane.matches("fix previous failure").count(), 1, "{pane:?}");
     assert!(!pane.contains("a --fish-ai"), "{pane:?}");
+    assert!(!pane.contains("__a_ai_turn"), "{pane:?}");
     let body = String::from_utf8(requests[0].body.clone()).unwrap();
     let body: serde_json::Value = serde_json::from_str(&body).unwrap();
     let instructions = body["instructions"].as_str().unwrap();
@@ -1212,6 +1339,18 @@ async fn fresh_fish_records_shell_history_that_reaches_the_agent_request() {
     );
     assert!(instructions.contains("exit_code: 1"), "{instructions}");
     assert_eq!(body["input"][0]["content"], "fix previous failure");
+
+    // The internal exit-code carrier is not a user command, so it must never
+    // appear in the recorded shell context of a later turn.
+    let second = String::from_utf8(requests[1].body.clone()).unwrap();
+    let second: serde_json::Value = serde_json::from_str(&second).unwrap();
+    let second_instructions = second["instructions"].as_str().unwrap();
+    assert!(
+        !second_instructions.contains("__a_ai_turn"),
+        "{second_instructions}"
+    );
+    let last_input = second["input"].as_array().unwrap().last().unwrap();
+    assert_eq!(last_input["content"], "second turn");
 }
 
 #[cfg(unix)]
@@ -1434,26 +1573,10 @@ async fn escape_cancels_a_running_bash_tool_and_returns_to_the_shell() {
     tmux_send_key(&socket, session, "Enter").await;
     wait_for_tmux_text(&socket, session, "escape-started").await;
     tmux_send_hex(&socket, session, "1b").await;
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    let current = Command::new("tmux")
-        .args([
-            "-L",
-            &socket,
-            "display-message",
-            "-p",
-            "-t",
-            session,
-            "#{pane_current_command}",
-        ])
-        .output()
-        .await
-        .unwrap();
+    // Poll for the shell instead of assuming how long the cancellation takes;
+    // a fixed wait fails once the machine is loaded.
+    wait_for_pane_command(&socket, session, "bash").await;
     let pane = tmux_history(&socket, session).await;
-    assert_eq!(
-        String::from_utf8_lossy(&current.stdout).trim(),
-        "bash",
-        "{pane:?}"
-    );
     assert!(pane.contains("× bash  cancelled"), "{pane:?}");
     assert_eq!(pane.matches("escape-finished").count(), 1, "{pane:?}");
 
@@ -1591,7 +1714,7 @@ async fn tmux_send_text(socket: &str, session: &str, text: &str) {
 }
 
 async fn wait_for_pane_command(socket: &str, session: &str, command: &str) {
-    for _ in 0..120 {
+    for _ in 0..400 {
         let output = Command::new("tmux")
             .args([
                 "-L",
@@ -1654,7 +1777,7 @@ async fn tmux_history(socket: &str, session: &str) -> String {
 }
 
 async fn wait_for_fish_prompt(socket: &str, session: &str) {
-    for _ in 0..80 {
+    for _ in 0..400 {
         let pane = tmux_pane(socket, session).await;
         if pane
             .lines()
@@ -1678,7 +1801,7 @@ async fn wait_for_fish_prompt(socket: &str, session: &str) {
 }
 
 async fn wait_for_agent_prompt(socket: &str, session: &str) {
-    for _ in 0..120 {
+    for _ in 0..400 {
         let pane = tmux_pane(socket, session).await;
         if pane
             .lines()
@@ -1697,6 +1820,22 @@ async fn wait_for_agent_prompt(socket: &str, session: &str) {
         "agent prompt did not appear: {:?}",
         tmux_pane(socket, session).await
     );
+}
+
+async fn wait_for_tmux_text_count(
+    socket: &str,
+    session: &str,
+    text: &str,
+    count: usize,
+) -> Option<String> {
+    for _ in 0..120 {
+        let pane = tmux_pane(socket, session).await;
+        if pane.matches(text).count() >= count {
+            return Some(pane);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    None
 }
 
 async fn wait_for_tmux_text(socket: &str, session: &str, text: &str) -> String {

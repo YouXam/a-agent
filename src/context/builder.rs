@@ -8,7 +8,6 @@ pub struct ContextInput {
     pub cwd: PathBuf,
     pub agents: Vec<AgentsFile>,
     pub skills: Vec<SkillMetadata>,
-    pub targeted_files: Vec<PathBuf>,
     pub platform: String,
     pub shell: String,
 }
@@ -25,7 +24,6 @@ pub fn build_system_prompt(input: &ContextInput) -> String {
          When independent tool calls can run in parallel, issue them together.\n\
          Do not parallelize dependent or conflicting mutations.\n\n\
          Follow all active AGENTS.md instructions.\n\
-         Read a relevant SKILL.md with read only when needed.\n\
          After modifying code, run relevant validation when practical.\n",
         input.cwd.display()
     );
@@ -40,7 +38,9 @@ pub fn build_system_prompt(input: &ContextInput) -> String {
         }
     }
     if !input.skills.is_empty() {
-        prompt.push_str("\nAvailable Skills:\n");
+        prompt.push_str(
+            "\nAvailable Skills. Each one lists only its name and description; when a task matches a description, read the SKILL.md at the listed path before proceeding. Resolve relative paths inside a skill against that skill's own directory, which is the parent of its SKILL.md, and pass absolute paths to tools.\n",
+        );
         for skill in &input.skills {
             let _ = write!(
                 prompt,
@@ -56,11 +56,5 @@ pub fn build_system_prompt(input: &ContextInput) -> String {
         "\nEnvironment:\n- platform: {}\n- shell: {}\n",
         input.platform, input.shell
     );
-    if !input.targeted_files.is_empty() {
-        prompt.push_str("\nTargeted files:\n");
-        for path in &input.targeted_files {
-            let _ = writeln!(prompt, "- {}", path.display());
-        }
-    }
     prompt
 }
