@@ -38,20 +38,50 @@ function __a_postexec --on-event fish_postexec
         --duration-ms "$duration_ms" >/dev/null 2>&1
 end
 
+# Silences the prompt for one command so the row Fish echoes for it has a known
+# height. Counting the theme's rows instead does not work: a transient prompt
+# renders a different number of rows than the one that was counted, which is
+# enough to erase the user's own input line.
+function __a_silence_prompt
+    functions -q fish_prompt && functions --copy fish_prompt __a_saved_fish_prompt
+    functions -q fish_right_prompt &&
+        functions --copy fish_right_prompt __a_saved_fish_right_prompt
+    # Still run the theme's own prompt so its bookkeeping happens, such as
+    # clearing a one-shot transient-prompt flag, but discard the output so the
+    # echoed command line occupies exactly one row.
+    function fish_prompt
+        functions -q __a_saved_fish_prompt && __a_saved_fish_prompt >/dev/null 2>&1
+        return 0
+    end
+    function fish_right_prompt
+        functions -q __a_saved_fish_right_prompt &&
+            __a_saved_fish_right_prompt >/dev/null 2>&1
+        return 0
+    end
+end
+
+function __a_restore_prompt
+    functions -e fish_prompt fish_right_prompt
+    if functions -q __a_saved_fish_prompt
+        functions --copy __a_saved_fish_prompt fish_prompt
+        functions -e __a_saved_fish_prompt
+    end
+    if functions -q __a_saved_fish_right_prompt
+        functions --copy __a_saved_fish_right_prompt fish_right_prompt
+        functions -e __a_saved_fish_right_prompt
+    end
+end
+
 # Fish saves and restores $status around key bindings and event handlers, and
 # $status itself is read-only, so a turn started from inside the Ctrl+G binding
 # can never set the shell's exit code. Running the turn as a real command line
 # is the only way, and then $status is simply the agent's exit code. Fish echoes
 # the command line it runs and adds it to history, so this removes itself from
-# history and erases the echoed line before the agent writes anything.
+# history and erases the one echoed row before the agent writes anything.
 function __a_ai_turn
     history delete --exact --case-sensitive -- __a_ai_turn >/dev/null 2>&1
-    set -l rows 1
-    if set -q __a_ai_turn_rows
-        set rows $__a_ai_turn_rows
-        set -e __a_ai_turn_rows
-    end
-    printf '\e[%dA\r\e[J' $rows
+    printf '\e[1A\r\e[J'
+    __a_restore_prompt
     set -lx A_FISH_AI_PROMPT "$__a_ai_pending_prompt"
     set -e __a_ai_pending_prompt
     command a --fish-ai --fish-session-key "$__a_fish_session_key" --one-turn
@@ -136,7 +166,7 @@ function __a_ai_prompt
         if test -n (string trim -- "$prompt")
             if test "$__a_ai_turn_mode" = once
                 set -g __a_ai_pending_prompt "$prompt"
-                set -g __a_ai_turn_rows $shell_prompt_rows
+                __a_silence_prompt
                 commandline -r __a_ai_turn
                 commandline -f execute
                 return

@@ -425,6 +425,113 @@ fn fish_script_has_metadata_hooks_dedicated_ai_read_and_mode_bindings() {
     assert!(!script.contains("bind -M insert \\r"));
 }
 
+/// A theme with a multi-row prompt that collapses to a single row for the
+/// command being submitted, the way Tide's transient prompt does. Counting the
+/// theme's rows cannot survive this, because the number of rows drawn for the
+/// executed command differs from the number that was counted.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_transient_multi_row_prompt_keeps_the_ai_input_line() {
+    if Command::new("tmux").arg("-V").output().await.is_err() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let bin = temp.path().join("bin");
+    let log = temp.path().join("calls.log");
+    std::fs::create_dir_all(&bin).unwrap();
+    let fake_a = bin.join("a");
+    std::fs::write(&fake_a, "#!/bin/sh\nprintf 'agent invoked\\n'\nexit 0\n").unwrap();
+    std::fs::set_permissions(&fake_a, std::fs::Permissions::from_mode(0o755)).unwrap();
+    install_to(&home).unwrap();
+    std::fs::write(
+        home.join(".config/fish/config.fish"),
+        concat!(
+            "function fish_prompt\n",
+            "    set -l code $status\n",
+            "    if set -q _fake_transient\n",
+            "        printf '[%s]# ' $code\n",
+            "    else\n",
+            "        printf 'INFO-ROW\\n[%s]# ' $code\n",
+            "    end\n",
+            "end\n",
+            // The theme clears its own one-shot flag while rendering, so the
+            // integration has to keep that bookkeeping alive even when it
+            // suppresses the prompt's output.
+            "function fish_right_prompt\n",
+            "    set -e _fake_transient\n",
+            "    true\n",
+            "end\n",
+            "function _fake_enter_transient\n",
+            "    set -g _fake_transient\n",
+            "    commandline -f repaint\n",
+            "    commandline -f execute\n",
+            "end\n",
+            "bind \\r _fake_enter_transient\n",
+            "bind -M insert \\r _fake_enter_transient\n",
+        ),
+    )
+    .unwrap();
+
+    let socket = format!("a-fish-transient-{}", std::process::id());
+    let session = "fish-transient";
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let fish_command = format!(
+        "env HOME={} XDG_CONFIG_HOME={}/.config PATH={} A_AGENT_TEST_LOG={} fish",
+        home.display(),
+        home.display(),
+        path,
+        log.display()
+    );
+    let started = Command::new("tmux")
+        .args([
+            "-L",
+            &socket,
+            "new-session",
+            "-d",
+            "-x",
+            "100",
+            "-y",
+            "24",
+            "-s",
+            session,
+            &fish_command,
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    wait_for_prompt(&socket, session).await;
+    tmux_key(&socket, session, "C-g").await;
+    wait_for_last_line(&socket, session, |line| line.contains("a>")).await;
+    tmux_type(&socket, session, "hi").await;
+    tmux_key(&socket, session, "Enter").await;
+    let pane = wait_for_pane_count(&socket, session, "agent invoked", 1).await;
+    wait_for_last_line(&socket, session, |line| line.contains("[0]#")).await;
+    let pane = tmux_capture(&socket, session).await + &pane;
+    let _ = Command::new("tmux")
+        .args(["-L", &socket, "kill-server"])
+        .status()
+        .await;
+
+    assert!(
+        pane.contains("a> hi"),
+        "the input line was erased: {pane:?}"
+    );
+    assert!(!pane.contains("__a_ai_turn"), "{pane:?}");
+    // The prompt that follows the turn is the theme's full form again, so the
+    // theme's transient flag was consumed rather than left set.
+    let after_turn = pane.split("agent invoked").nth(1).unwrap_or_default();
+    assert!(
+        after_turn.contains("INFO-ROW"),
+        "the prompt after the turn should be the full one: {after_turn:?}"
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn new_fish_has_immediate_ai_prompt_without_shell_completion_and_invokes_agent() {
