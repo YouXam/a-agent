@@ -329,14 +329,19 @@ async fn bash_cancellation_terminates_the_process_group() {
     let trigger = cancel.clone();
     let pid_path = temp.path().join("child.pid");
     let watched_pid_path = pid_path.clone();
-    tokio::spawn(async move {
-        for _ in 0..200 {
+    // Cancel only once bash has recorded its background child, and give a loaded
+    // machine time to get there: cancelling early kills bash before it writes the
+    // file, which used to surface as a bare "No such file or directory".
+    let watcher = tokio::spawn(async move {
+        for _ in 0..1000 {
             if tokio::fs::metadata(&watched_pid_path).await.is_ok() {
-                break;
+                trigger.cancel();
+                return true;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         trigger.cancel();
+        false
     });
     execute_bash_cancellable(
         temp.path(),
@@ -354,6 +359,10 @@ async fn bash_cancellation_terminates_the_process_group() {
     )
     .await
     .unwrap();
+    assert!(
+        watcher.await.unwrap(),
+        "bash never recorded a background child, so nothing was cancelled"
+    );
     let pid = fs::read_to_string(pid_path).unwrap();
     tokio::time::sleep(Duration::from_millis(30)).await;
     let pid = pid.trim().parse::<i32>().unwrap();
