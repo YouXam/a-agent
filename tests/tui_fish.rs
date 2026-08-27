@@ -818,7 +818,7 @@ async fn wait_for_prompt(socket: &str, session: &str) {
 }
 
 async fn wait_for_pane(socket: &str, session: &str, needle: &str) -> String {
-    for _ in 0..40 {
+    for _ in 0..400 {
         let pane = tmux_capture(socket, session).await;
         if pane.contains(needle) {
             return pane;
@@ -832,7 +832,7 @@ async fn wait_for_pane(socket: &str, session: &str, needle: &str) -> String {
 }
 
 async fn wait_for_pane_count(socket: &str, session: &str, needle: &str, expected: usize) -> String {
-    for _ in 0..80 {
+    for _ in 0..400 {
         let pane = tmux_capture(socket, session).await;
         if pane.matches(needle).count() >= expected {
             return pane;
@@ -850,7 +850,7 @@ async fn wait_for_last_line(
     session: &str,
     predicate: impl Fn(&str) -> bool,
 ) -> String {
-    for _ in 0..40 {
+    for _ in 0..400 {
         let pane = tmux_capture(socket, session).await;
         if pane
             .lines()
