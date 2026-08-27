@@ -4,6 +4,7 @@ pub mod config;
 pub mod context;
 pub mod fish;
 pub mod model;
+pub mod pricing;
 pub mod provider;
 pub mod session;
 pub mod tools;

@@ -13,14 +13,19 @@ use tokio_util::sync::CancellationToken;
 use crate::agent::{Agent, ContextStatus};
 use crate::config::{Config, ModelSelection};
 use crate::context::{
-    ContextInput, build_system_prompt, discover_agents_for_targets, discover_skills, skill_roots,
+    ContextInput, StdinSource, build_system_prompt, discover_agents_for_targets, discover_skills,
+    skill_roots, stdin_source,
 };
 use crate::fish;
 use crate::model::ContentBlock;
+use crate::pricing;
 use crate::provider::create_provider;
 use crate::session::{NewSession, SessionStore, ShellHistoryItem, default_database_path};
+use crate::tools::bash::BashOptions;
 use crate::tools::runner::{CoreToolExecutor, ToolRunner};
-use crate::tui::{InlineRenderer, InputAction, InputEditor, InputMode, RenderLimits};
+use crate::tui::{
+    InlineRenderer, InputAction, InputEditor, InputMode, RenderLimits, RevertLine, mention_paths,
+};
 
 use super::{CliArgs, args};
 
@@ -120,11 +125,16 @@ pub async fn run() -> Result<i32> {
         &session.model,
         session.effort.as_deref(),
     )?;
-    let executor = Arc::new(CoreToolExecutor::new(
-        cwd,
+    let executor = Arc::new(CoreToolExecutor::with_snapshot_limit(
+        cwd.clone(),
         config.context.read_max_lines,
-        Duration::from_secs(config.tools.bash_timeout_seconds),
+        BashOptions {
+            timeout: Duration::from_secs(config.tools.bash_timeout_seconds),
+            max_timeout: Duration::from_secs(config.tools.bash_max_timeout_seconds),
+            max_output_bytes: config.tools.max_output_bytes,
+        },
         config.tools.max_output_bytes,
+        config.session.snapshot_max_bytes,
     ));
     let tools = Arc::new(ToolRunner::new(executor, config.tools.max_parallel));
     let store = Arc::new(Mutex::new(store));
@@ -143,9 +153,10 @@ pub async fn run() -> Result<i32> {
             tool_output_max_bytes: config.ui.tool_output_max_bytes,
             tool_output_max_lines: config.ui.tool_output_max_lines,
             tool_live_output_lines: config.ui.tool_live_output_lines,
+            patch_diff_max_lines: config.ui.patch_diff_max_lines,
         },
     )?;
-    let mut input = InputEditor::with_reasoning_toggle(&config.ui.reasoning_toggle)?;
+    let mut input = InputEditor::with_reasoning_toggle(&config.ui.reasoning_toggle, cwd.clone())?;
     if !args.fish_ai {
         let history = store
             .lock()
@@ -198,7 +209,7 @@ pub async fn run() -> Result<i32> {
                 render_session_history(&renderer, &store, &session.id)?;
             }
             SlashAction::Status => {
-                render_agent_status(&renderer, &session, &selection, &agent)?;
+                render_agent_status(&renderer, &session, &selection, &agent, &store).await?;
             }
             SlashAction::Handled => {}
             SlashAction::NotCommand => {
@@ -207,11 +218,13 @@ pub async fn run() -> Result<i32> {
                 } else {
                     renderer.render_user(prompt)?;
                 }
-                let contextual = contextual_prompt(
-                    prompt,
-                    stdin_context.as_deref(),
-                    &std::mem::take(&mut pending_targets),
-                );
+                let mut turn_targets = std::mem::take(&mut pending_targets);
+                for path in mentioned_targets(&cwd, prompt) {
+                    if !turn_targets.contains(&path) {
+                        turn_targets.push(path);
+                    }
+                }
+                let contextual = contextual_prompt(prompt, stdin_context.as_deref(), &turn_targets);
                 if run_turn(&agent, &renderer, &contextual).await? && args.one_turn {
                     return Ok(130);
                 }
@@ -277,13 +290,19 @@ pub async fn run() -> Result<i32> {
                         render_session_history(&renderer, &store, &session.id)?;
                     }
                     SlashAction::Status => {
-                        render_agent_status(&renderer, &session, &selection, &agent)?;
+                        render_agent_status(&renderer, &session, &selection, &agent, &store)
+                            .await?;
                     }
                     SlashAction::Handled => {}
                     SlashAction::NotCommand => {
                         renderer.begin_turn()?;
-                        let contextual =
-                            contextual_prompt(&prompt, None, &std::mem::take(&mut pending_targets));
+                        let mut turn_targets = std::mem::take(&mut pending_targets);
+                        for path in mentioned_targets(&cwd, &prompt) {
+                            if !turn_targets.contains(&path) {
+                                turn_targets.push(path);
+                            }
+                        }
+                        let contextual = contextual_prompt(&prompt, None, &turn_targets);
                         let cancelled = run_turn(&agent, &renderer, &contextual).await?;
                         if mode == InputMode::Once {
                             return Ok(if cancelled { 130 } else { 0 });
@@ -319,7 +338,10 @@ pub async fn run() -> Result<i32> {
                         (item.id, label)
                     })
                     .collect::<Vec<_>>();
-                if let Some(item_id) = input.select_checkpoint(&choices, &renderer)? {
+                if let Some(item_id) = input.select_checkpoint(&choices, &renderer)?
+                    && confirm_rewind(&renderer, &mut input, &store, &session.id, &item_id)?
+                        == RewindDecision::Proceed
+                {
                     store
                         .lock()
                         .map_err(|_| anyhow::anyhow!("session store lock poisoned"))?
@@ -635,11 +657,12 @@ fn render_context_status(renderer: &InlineRenderer, status: ContextStatus) -> Re
     Ok(())
 }
 
-fn render_agent_status(
+async fn render_agent_status(
     renderer: &InlineRenderer,
     session: &crate::session::Session,
     selection: &ModelSelection,
     agent: &Agent,
+    store: &Arc<Mutex<SessionStore>>,
 ) -> Result<()> {
     renderer.render_status(&format!(
         "session {} · model {} · {} · effort {}",
@@ -648,7 +671,246 @@ fn render_agent_status(
         selection.provider.model,
         selection.effort.as_deref().unwrap_or("default")
     ))?;
-    render_context_status(renderer, agent.context_status()?)
+    render_context_status(renderer, agent.context_status()?)?;
+    render_cost_status(renderer, session, selection, store).await
+}
+
+/// What to do about the files the agent wrote after the checkpoint being rewound
+/// to.
+///
+/// Rewinding used to move only the conversation, which made "go back" a
+/// half-truth: every file the agent had written stayed written. Reverting files
+/// is not something to do silently either, so the plan is shown and the choice is
+/// explicit.
+#[derive(Debug, PartialEq, Eq)]
+enum RewindDecision {
+    Proceed,
+    Cancel,
+}
+
+const REWIND_CONVERSATION_ONLY: &str = "rewind the conversation only";
+const REWIND_CANCEL: &str = "cancel";
+
+fn confirm_rewind(
+    renderer: &InlineRenderer,
+    input: &mut InputEditor,
+    store: &Arc<Mutex<SessionStore>>,
+    session_id: &str,
+    item_id: &str,
+) -> Result<RewindDecision> {
+    let snapshots = crate::tools::patch::coalesce_snapshots(
+        store
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session store lock poisoned"))?
+            .snapshots_from_turn(session_id, item_id)?,
+    );
+    if snapshots.is_empty() {
+        return Ok(RewindDecision::Proceed);
+    }
+
+    let mut restorable = Vec::new();
+    let mut plan = Vec::new();
+    for snapshot in snapshots {
+        let path = snapshot.path.display().to_string();
+        match snapshot.restore_blocker() {
+            Some(reason) => plan.push(RevertLine {
+                action: "keep".into(),
+                path,
+                detail: reason,
+                blocked: true,
+            }),
+            None => {
+                plan.push(RevertLine {
+                    action: revert_action(&snapshot).into(),
+                    path,
+                    detail: revert_detail(&snapshot),
+                    blocked: false,
+                });
+                restorable.push(snapshot);
+            }
+        }
+    }
+
+    renderer.render_status(&format!(
+        "the turns after this point touched {} file(s):",
+        plan.len()
+    ))?;
+    renderer.render_revert_plan(&plan)?;
+
+    let mut choices = vec![REWIND_CONVERSATION_ONLY.to_owned()];
+    if !restorable.is_empty() {
+        choices.push(format!(
+            "rewind and revert {} file{}",
+            restorable.len(),
+            if restorable.len() == 1 { "" } else { "s" }
+        ));
+    }
+    choices.push(REWIND_CANCEL.to_owned());
+    let Some(choice) = input.select_option("Rewind", &choices, 0)? else {
+        renderer.render_status("cancelled")?;
+        return Ok(RewindDecision::Cancel);
+    };
+    match choices[choice].as_str() {
+        REWIND_CANCEL => {
+            renderer.render_status("cancelled")?;
+            return Ok(RewindDecision::Cancel);
+        }
+        REWIND_CONVERSATION_ONLY => {
+            renderer.render_status("files left as they are")?;
+            return Ok(RewindDecision::Proceed);
+        }
+        _ => {}
+    }
+
+    let mut reverted = 0;
+    for snapshot in &restorable {
+        match snapshot.restore() {
+            Ok(()) => reverted += 1,
+            Err(error) => renderer.render_status(&format!(
+                "could not revert {}: {error}",
+                snapshot.path.display()
+            ))?,
+        }
+    }
+    renderer.render_status(&format!("reverted {reverted} file(s)"))?;
+    store
+        .lock()
+        .map_err(|_| anyhow::anyhow!("session store lock poisoned"))?
+        .delete_snapshots_from_turn(session_id, item_id)?;
+    Ok(RewindDecision::Proceed)
+}
+
+/// What reverting a change means, phrased as the action it performs.
+fn revert_action(snapshot: &crate::tools::patch::FileSnapshot) -> &'static str {
+    use crate::tools::patch::FileChange;
+    match snapshot.change {
+        FileChange::Added => "delete",
+        FileChange::Modified => "restore",
+        FileChange::Deleted => "recreate",
+    }
+}
+
+fn revert_detail(snapshot: &crate::tools::patch::FileSnapshot) -> String {
+    use crate::tools::patch::FileChange;
+    match snapshot.change {
+        FileChange::Added => "created after this point".into(),
+        FileChange::Deleted => "deleted after this point".into(),
+        FileChange::Modified => format!("+{} -{}", snapshot.added, snapshot.removed),
+    }
+}
+
+/// Prints the cost line. Each request is priced by its own size so a tiered
+/// schedule applies per request, and the number is labelled as a list price:
+/// discounts that depend on when a request was sent, such as off-peak rates, are
+/// not published in machine-readable form and are not modelled here.
+fn report_cost(
+    renderer: &InlineRenderer,
+    requests: &[crate::model::Usage],
+    schedule: &pricing::Schedule,
+    source: &str,
+) -> Result<()> {
+    if !pricing::has_measured_usage(requests) {
+        renderer.render_status("cost unknown: this provider reported no token usage")?;
+        return Ok(());
+    }
+    let cost = pricing::session_cost(requests, schedule);
+    let tiered = if schedule.is_tiered() {
+        " · tiered by request size"
+    } else {
+        ""
+    };
+    renderer.render_status(&format!(
+        "cost {} list price · {source}{tiered}",
+        pricing::format_cost(cost)
+    ))?;
+    Ok(())
+}
+
+/// Prints spend for the session. The prices are looked up only here, never at
+/// startup, and the line is appended after the rest of the status so a slow or
+/// failed lookup cannot delay what is already known.
+async fn render_cost_status(
+    renderer: &InlineRenderer,
+    session: &crate::session::Session,
+    selection: &ModelSelection,
+    store: &Arc<Mutex<SessionStore>>,
+) -> Result<()> {
+    let requests = store
+        .lock()
+        .map_err(|_| anyhow::anyhow!("session store lock poisoned"))?
+        .session_request_usage(&session.id)?;
+    let key = selection
+        .pricing
+        .clone()
+        .unwrap_or_else(|| selection.provider.model.clone());
+
+    if let Some(rates) = selection.cost {
+        report_cost(
+            renderer,
+            &requests,
+            &pricing::Schedule::flat(rates),
+            "configured prices",
+        )?;
+        return Ok(());
+    }
+    let cached = store
+        .lock()
+        .map_err(|_| anyhow::anyhow!("session store lock poisoned"))?
+        .cached_prices(&key, pricing::CACHE_TTL)?;
+    if let Some((schedule, source)) = cached {
+        report_cost(renderer, &requests, &schedule, &source)?;
+        return Ok(());
+    }
+
+    renderer.begin_transient("pricing")?;
+    let catalog = pricing::fetch_catalog(&pricing::source_url(), Duration::from_secs(10)).await;
+    renderer.end_transient()?;
+    let catalog = match catalog {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            renderer.render_status(&format!("cost unavailable: {error}"))?;
+            return Ok(());
+        }
+    };
+    match pricing::resolve_from_catalog(
+        &catalog,
+        &selection.provider.model,
+        selection.pricing.as_deref(),
+    ) {
+        pricing::Resolution::Known { schedule, source } => {
+            store
+                .lock()
+                .map_err(|_| anyhow::anyhow!("session store lock poisoned"))?
+                .cache_prices(&key, &source, &schedule)?;
+            report_cost(renderer, &requests, &schedule, &source)?;
+        }
+        pricing::Resolution::Ambiguous { model, providers } => {
+            let suggested = pricing::likely_provider(&model, &providers)
+                .map_or("provider", String::as_str)
+                .to_owned();
+            let mut listed = providers
+                .iter()
+                .take(4)
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ");
+            if providers.len() > 4 {
+                write!(listed, ", … {} more", providers.len() - 4)?;
+            }
+            renderer.render_status(&format!(
+                "cost unavailable: {} providers price {model} differently ({listed})",
+                providers.len()
+            ))?;
+            renderer.render_status(&format!(
+                "set pricing = \"{suggested}/{model}\" under [models.{}] to pick one",
+                selection.name
+            ))?;
+        }
+        pricing::Resolution::Unknown(reason) => {
+            renderer.render_status(&format!("cost unavailable: {reason}"))?;
+        }
+    }
+    Ok(())
 }
 
 fn format_tokens(value: u64) -> String {
@@ -872,7 +1134,7 @@ fn resolve_targets(cwd: &Path, files: &[String]) -> Result<Vec<PathBuf>> {
 }
 
 fn read_stdin_tail(max_bytes: usize) -> Result<Option<String>> {
-    if io::stdin().is_terminal() {
+    if stdin_source() != StdinSource::Stream {
         return Ok(None);
     }
     let mut input = io::stdin().lock();
@@ -924,6 +1186,22 @@ fn append_shell_context(system_prompt: &mut String, shell: &[ShellHistoryItem]) 
                 .map_or_else(|| "?".into(), |code| code.to_string())
         ));
     }
+}
+
+/// Paths the user pointed at with `@` inside the prompt. Resolution failures are
+/// dropped rather than reported: the mention still reads fine to the model, and
+/// refusing the whole turn over a typo would be worse.
+fn mentioned_targets(cwd: &Path, prompt: &str) -> Vec<PathBuf> {
+    let mut targets = Vec::new();
+    for mention in mention_paths(prompt) {
+        if let Ok(resolved) = resolve_targets(cwd, std::slice::from_ref(&mention))
+            && let Some(path) = resolved.into_iter().next()
+            && !targets.contains(&path)
+        {
+            targets.push(path);
+        }
+    }
+    targets
 }
 
 fn contextual_prompt(prompt: &str, stdin: Option<&str>, targets: &[PathBuf]) -> String {

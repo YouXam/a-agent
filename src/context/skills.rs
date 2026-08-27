@@ -52,10 +52,9 @@ fn index_root(root: &Path, skills: &mut BTreeMap<String, SkillMetadata>) -> Resu
         if !path.is_file() {
             continue;
         }
-        let mut source = String::new();
-        let mut reader: Take<File> = File::open(&path)?.take(METADATA_LIMIT);
-        reader.read_to_string(&mut source)?;
-        match parse_skill_metadata(&source, &path) {
+        // One unreadable skill must never stop the agent from starting, so the
+        // read is reported like a parse failure instead of propagating.
+        match read_metadata_head(&path).and_then(|source| parse_skill_metadata(&source, &path)) {
             Ok(metadata) => {
                 skills.insert(metadata.name.clone(), metadata);
             }
@@ -63,6 +62,23 @@ fn index_root(root: &Path, skills: &mut BTreeMap<String, SkillMetadata>) -> Resu
         }
     }
     Ok(())
+}
+
+/// Reads enough of a `SKILL.md` to hold its frontmatter.
+///
+/// The cap is a byte count, so it can land inside a multi-byte character. The
+/// bytes are decoded lossily rather than strictly: a skill whose body is long and
+/// not ASCII is completely normal, and refusing to decode it used to abort
+/// startup for every skill that followed.
+fn read_metadata_head(path: &Path) -> Result<String> {
+    let mut bytes = Vec::new();
+    let mut reader: Take<File> = File::open(path)
+        .with_context(|| format!("open {}", path.display()))?
+        .take(METADATA_LIMIT);
+    reader
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("read {}", path.display()))?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Reads the `name` and `description` of a skill from its YAML frontmatter.

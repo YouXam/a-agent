@@ -109,8 +109,22 @@ pub struct ModelProfile {
     pub efforts: Vec<String>,
     pub context_window: Option<u64>,
     pub max_tokens: Option<u32>,
+    /// A models.dev `provider/model` key, needed when the model id alone is
+    /// ambiguous across providers that price it differently.
+    pub pricing: Option<String>,
+    pub cost: Option<Rates>,
     pub headers: BTreeMap<String, String>,
     pub request: BTreeMap<String, serde_json::Value>,
+}
+
+/// Token prices in USD per million tokens, matching how models.dev states them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Rates {
+    pub input: f64,
+    pub output: f64,
+    pub cache_read: f64,
+    pub cache_write: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -121,6 +135,8 @@ pub struct ModelSelection {
     pub effort: Option<String>,
     pub efforts: Vec<String>,
     pub context_window: Option<u64>,
+    pub pricing: Option<String>,
+    pub cost: Option<Rates>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,6 +148,7 @@ pub struct UiConfig {
     pub tool_output_max_bytes: usize,
     pub tool_output_max_lines: usize,
     pub tool_live_output_lines: usize,
+    pub patch_diff_max_lines: usize,
 }
 
 impl Default for UiConfig {
@@ -143,6 +160,7 @@ impl Default for UiConfig {
             tool_output_max_bytes: 8192,
             tool_output_max_lines: 16,
             tool_live_output_lines: 6,
+            patch_diff_max_lines: 24,
         }
     }
 }
@@ -150,7 +168,12 @@ impl Default for UiConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ToolsConfig {
+    /// Applied when a bash call does not ask for a timeout of its own.
     pub bash_timeout_seconds: u64,
+    /// Most a bash call may ask for. Commands the model expects to be slow can
+    /// raise their own limit up to this, so the default stays short without
+    /// making long builds impossible.
+    pub bash_max_timeout_seconds: u64,
     pub max_parallel: usize,
     pub max_output_bytes: usize,
 }
@@ -159,6 +182,7 @@ impl Default for ToolsConfig {
     fn default() -> Self {
         Self {
             bash_timeout_seconds: 120,
+            bash_max_timeout_seconds: 1800,
             max_parallel: 8,
             max_output_bytes: 65_536,
         }
@@ -189,6 +213,9 @@ pub struct SessionConfig {
     pub max_agent_cycles: usize,
     pub shell_history_limit: usize,
     pub input_history_limit: usize,
+    /// How much of a file's previous contents to keep so a rewind can restore
+    /// it. Larger files are recorded as unrestorable rather than truncated.
+    pub snapshot_max_bytes: usize,
 }
 
 impl Default for SessionConfig {
@@ -197,6 +224,7 @@ impl Default for SessionConfig {
             max_agent_cycles: 50,
             shell_history_limit: 5000,
             input_history_limit: 1000,
+            snapshot_max_bytes: 1024 * 1024,
         }
     }
 }
@@ -290,6 +318,13 @@ impl Config {
         if config.tools.max_parallel == 0 {
             anyhow::bail!("tools.max_parallel must be greater than zero");
         }
+        if config.tools.bash_max_timeout_seconds < config.tools.bash_timeout_seconds {
+            anyhow::bail!(
+                "tools.bash_max_timeout_seconds ({}) must be at least tools.bash_timeout_seconds ({})",
+                config.tools.bash_max_timeout_seconds,
+                config.tools.bash_timeout_seconds
+            );
+        }
         config.validate_models()?;
         Ok(config)
     }
@@ -347,6 +382,8 @@ impl Config {
             effort: effort.map(str::to_owned),
             efforts: profile.efforts.clone(),
             context_window: profile.context_window,
+            pricing: profile.pricing.clone(),
+            cost: profile.cost,
         })
     }
 

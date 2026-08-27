@@ -17,12 +17,37 @@ use crate::provider::EventSink;
 const GENERATION_ID: &str = "__a_generation";
 const GENERATION_CONTENT_ID: &str = "__a_generation_content";
 
+/// One file in a rewind plan: what will happen to it, and why.
+#[derive(Debug, Clone)]
+pub struct RevertLine {
+    /// Imperative verb, so the list reads as the plan it is rather than as
+    /// history: `delete`, `restore`, `recreate`, `keep`.
+    pub action: String,
+    pub path: String,
+    pub detail: String,
+    pub blocked: bool,
+}
+
+impl RevertLine {
+    fn color(&self) -> Color {
+        if self.blocked {
+            return Color::DarkGrey;
+        }
+        match self.action.as_str() {
+            "delete" => Color::DarkRed,
+            "recreate" => Color::DarkGreen,
+            _ => Color::DarkYellow,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct RenderLimits {
     pub tool_input_max_bytes: usize,
     pub tool_output_max_bytes: usize,
     pub tool_output_max_lines: usize,
     pub tool_live_output_lines: usize,
+    pub patch_diff_max_lines: usize,
 }
 
 impl Default for RenderLimits {
@@ -32,6 +57,7 @@ impl Default for RenderLimits {
             tool_output_max_bytes: 8192,
             tool_output_max_lines: 16,
             tool_live_output_lines: 6,
+            patch_diff_max_lines: 24,
         }
     }
 }
@@ -171,6 +197,57 @@ impl InlineRenderer {
         })
     }
 
+    /// Lists what a rewind would do to each file, one line per path, using the
+    /// same colors as a patch block so the plan reads at a glance.
+    pub fn render_revert_plan(&self, lines: &[RevertLine]) -> io::Result<()> {
+        let width = lines
+            .iter()
+            .map(|line| line.action.len())
+            .max()
+            .unwrap_or_default();
+        self.with_state(|state| {
+            state.flush_generation_pending()?;
+            state.finish_generation();
+            state.finish_open_lines()?;
+            for line in lines {
+                write_styled(&mut state.writer, state.color, "    ", Color::Reset, false)?;
+                write_styled(
+                    &mut state.writer,
+                    state.color,
+                    &line.action,
+                    line.color(),
+                    true,
+                )?;
+                write_styled(
+                    &mut state.writer,
+                    state.color,
+                    &" ".repeat(width - line.action.len() + 1),
+                    Color::Reset,
+                    false,
+                )?;
+                write_styled(
+                    &mut state.writer,
+                    state.color,
+                    &line.path,
+                    if line.blocked {
+                        Color::DarkGrey
+                    } else {
+                        Color::Reset
+                    },
+                    false,
+                )?;
+                write_styled(
+                    &mut state.writer,
+                    state.color,
+                    &format!("  {}\n", line.detail),
+                    Color::DarkGrey,
+                    false,
+                )?;
+            }
+            state.writer.flush()
+        })
+    }
+
     pub fn render_status(&self, message: &str) -> io::Result<()> {
         self.with_state(|state| {
             state.flush_generation_pending()?;
@@ -184,6 +261,24 @@ impl InlineRenderer {
                 false,
             )?;
             state.writer.flush()
+        })
+    }
+
+    /// Shows a labelled spinner in the transient region while something is being
+    /// awaited. Reuses the generation spinner, so nothing is drawn when stdout is
+    /// not a terminal and nothing reaches the scrollback either way.
+    pub fn begin_transient(&self, label: &str) -> io::Result<()> {
+        self.with_state(|state| {
+            state.start_generation()?;
+            state.update_generation_message(label);
+            Ok(())
+        })
+    }
+
+    pub fn end_transient(&self) -> io::Result<()> {
+        self.with_state(|state| {
+            state.finish_generation();
+            Ok(())
         })
     }
 
@@ -211,8 +306,9 @@ impl InlineRenderer {
                         })
                         .collect::<Vec<_>>()
                         .join("\n");
+                    let text = without_request_scaffolding(&text);
                     if !text.is_empty() {
-                        self.render_user(&text)?;
+                        self.render_user(text)?;
                     }
                 }
                 Role::Assistant => {
@@ -679,10 +775,22 @@ impl State {
                     &raw_arguments,
                     self.limits.tool_input_max_bytes,
                     truncated,
+                    self.limits.patch_diff_max_lines,
                 )
             }
             "bash" => {
-                write_tool_completion(&mut self.writer, self.color, symbol, color, &name, summary)?;
+                let summary = match bash_timeout_label(&raw_arguments) {
+                    Some(timeout) => format!("{summary} · {timeout}"),
+                    None => summary.to_owned(),
+                };
+                write_tool_completion(
+                    &mut self.writer,
+                    self.color,
+                    symbol,
+                    color,
+                    &name,
+                    &summary,
+                )?;
                 let input = limited_text(
                     &format_tool_input(&name, &raw_arguments),
                     self.limits.tool_input_max_bytes,
@@ -1038,6 +1146,14 @@ fn format_tool_input(name: &str, raw: &str) -> String {
     }
 }
 
+/// The timeout a bash call asked for, when it raised its own limit. A command
+/// that sits there for minutes should not look like a hang.
+fn bash_timeout_label(raw: &str) -> Option<String> {
+    let value = serde_json::from_str::<Value>(raw).ok()?;
+    let seconds = value.get("timeout_seconds").and_then(Value::as_u64)?;
+    Some(format!("timeout {seconds}s"))
+}
+
 fn live_tool_message(
     tool: &ToolDisplay,
     max_lines: usize,
@@ -1054,7 +1170,10 @@ fn live_tool_message(
                 "{first_line}{}",
                 if lines.next().is_some() { "…" } else { "" }
             ));
-            "bash".into()
+            match bash_timeout_label(&tool.arguments.text) {
+                Some(timeout) => format!("bash  {timeout}"),
+                None => "bash".into(),
+            }
         }
         "read" => format!("read  {}", read_detail(&tool.arguments.text)),
         "apply_patch" => {
@@ -1225,6 +1344,7 @@ fn render_patch_operations(
     raw_arguments: &str,
     max_bytes: usize,
     capture_truncated: bool,
+    diff_max_lines: usize,
 ) -> io::Result<()> {
     let operations = patch_operations(raw_arguments).join("\n");
     let limited = limited_text(&operations, max_bytes, 12, false);
@@ -1260,11 +1380,61 @@ fn render_patch_operations(
             false,
         )?;
     }
+    render_patch_diff(writer, color_enabled, raw_arguments, diff_max_lines)
+}
+
+/// Shows the hunks that were applied. The patch text the model sent *is* the
+/// diff, so no diffing is needed and nothing can drift between what is shown and
+/// what was written.
+fn render_patch_diff(
+    writer: &mut dyn Write,
+    color_enabled: bool,
+    raw_arguments: &str,
+    max_lines: usize,
+) -> io::Result<()> {
+    if max_lines == 0 {
+        return Ok(());
+    }
+    let patch = patch_text(raw_arguments);
+    let mut shown = 0;
+    let mut truncated = false;
+    for line in patch.lines() {
+        if line.starts_with("*** ") {
+            continue;
+        }
+        if shown == max_lines {
+            truncated = true;
+            break;
+        }
+        let color = match line.as_bytes().first() {
+            Some(b'+') => Color::DarkGreen,
+            Some(b'-') => Color::DarkRed,
+            Some(b'@') => Color::DarkGrey,
+            _ => Color::Reset,
+        };
+        write_styled(
+            writer,
+            color_enabled,
+            &format!("    {line}\n"),
+            color,
+            false,
+        )?;
+        shown += 1;
+    }
+    if truncated {
+        write_styled(
+            writer,
+            color_enabled,
+            "    … diff truncated\n",
+            Color::DarkYellow,
+            false,
+        )?;
+    }
     Ok(())
 }
 
-fn patch_operations(raw_arguments: &str) -> Vec<String> {
-    let patch = serde_json::from_str::<Value>(raw_arguments)
+fn patch_text(raw_arguments: &str) -> String {
+    serde_json::from_str::<Value>(raw_arguments)
         .ok()
         .and_then(|value| {
             value
@@ -1272,8 +1442,11 @@ fn patch_operations(raw_arguments: &str) -> Vec<String> {
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned)
         })
-        .unwrap_or_default();
-    patch
+        .unwrap_or_default()
+}
+
+fn patch_operations(raw_arguments: &str) -> Vec<String> {
+    patch_text(raw_arguments)
         .lines()
         .filter_map(|line| {
             line.strip_prefix("*** Update File: ")
@@ -1565,6 +1738,30 @@ fn write_prefixed_block(
         writeln!(writer)?;
     }
     Ok(())
+}
+
+/// Strips the target list the runtime prepends to a user message. It is part of
+/// the stored item because the model needs it again on resume, but replaying it
+/// would show the user machine scaffolding as their own words.
+///
+/// Only this block is stripped. A piped-stdin block contains blank lines of its
+/// own, so where it ends cannot be determined without guessing, and a wrong
+/// guess would hide part of the message instead.
+fn without_request_scaffolding(text: &str) -> &str {
+    const HEADER: &str = "Files provided with this request:\n";
+    let Some(rest) = text.strip_prefix(HEADER) else {
+        return text;
+    };
+    let mut cursor = rest;
+    while let Some((line, tail)) = cursor.split_once('\n') {
+        if line.starts_with("- ") {
+            cursor = tail;
+            continue;
+        }
+        // The blank line that separated this block from the next section.
+        return if line.is_empty() { tail } else { cursor };
+    }
+    cursor
 }
 
 fn write_styled(

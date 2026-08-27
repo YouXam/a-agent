@@ -111,6 +111,9 @@ async fn one_turn_cli_persists_and_resumes_without_eager_file_content() {
         .current_dir(&repo)
         .env("HOME", &home)
         .env("XDG_STATE_HOME", &state)
+        // Keep the price lookup off the network; cost itself is covered by
+        // status_reports_cost_from_configured_prices_and_survives_a_failed_lookup.
+        .env("A_PRICING_URL", "http://127.0.0.1:9/api.json")
         .output()
         .await
         .unwrap();
@@ -767,6 +770,377 @@ async fn first_agent_run_reports_the_generated_config_path() {
 }
 
 #[cfg(unix)]
+#[tokio::test]
+async fn status_reports_cost_from_configured_prices_and_survives_a_failed_lookup() {
+    let server = MockServer::start().await;
+    let sse = concat!(
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"done\"}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1000000,\"output_tokens\":500000}}}\n\n",
+        "data: [DONE]\n\n"
+    );
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse),
+        )
+        .mount(&server)
+        .await;
+
+    let temp = tempdir().unwrap();
+    let home = temp.path().join("home");
+    let repo = temp.path().join("repo");
+    let state = temp.path().join("state");
+    fs::create_dir_all(home.join(".config/a")).unwrap();
+    fs::create_dir_all(&repo).unwrap();
+    let priced = format!(
+        "{}\n[models.test.cost]\ninput = 1.0\noutput = 10.0\n",
+        responses_config(&server.uri())
+    );
+    fs::write(home.join(".config/a/config.toml"), &priced).unwrap();
+
+    let binary = env!("CARGO_BIN_EXE_a");
+    let run = |args: Vec<&'static str>| {
+        let mut command = Command::new(binary);
+        command
+            .args(args)
+            .current_dir(&repo)
+            .env("HOME", &home)
+            .env("XDG_STATE_HOME", &state)
+            // A closed port, so the lookup fails without touching models.dev.
+            .env("A_PRICING_URL", "http://127.0.0.1:9/api.json");
+        command
+    };
+    assert!(
+        run(vec!["-1", "spend some tokens"])
+            .output()
+            .await
+            .unwrap()
+            .status
+            .success()
+    );
+
+    let status = run(vec!["-r", "-1", "/status"]).output().await.unwrap();
+    let output = String::from_utf8_lossy(&status.stdout);
+    // 1M input at $1 plus 0.5M output at $10 is $6.00.
+    assert!(output.contains("cost $6.00"), "{output}");
+    assert!(output.contains("configured prices"), "{output}");
+    // Discounts that depend on when a request was sent are not modelled, so the
+    // number is labelled rather than presented as a bill.
+    assert!(output.contains("list price"), "{output}");
+    let cost_at = output.find("cost $6.00").unwrap();
+    let context_at = output.find("context ").unwrap();
+    assert!(
+        context_at < cost_at,
+        "context is known without a lookup, so it prints first: {output}"
+    );
+
+    // Without configured prices the lookup runs; a dead endpoint must leave the
+    // rest of the status intact.
+    fs::write(
+        home.join(".config/a/config.toml"),
+        responses_config(&server.uri()),
+    )
+    .unwrap();
+    let offline = run(vec!["-r", "-1", "/status"]).output().await.unwrap();
+    assert!(offline.status.success());
+    let offline_output = String::from_utf8_lossy(&offline.stdout);
+    assert!(offline_output.contains("context "), "{offline_output}");
+    assert!(
+        offline_output.contains("cost unavailable"),
+        "{offline_output}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn mentioning_a_file_with_at_completes_it_and_sends_it_as_a_target() {
+    if Command::new("tmux")
+        .arg("--version")
+        .output()
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let server = MockServer::start().await;
+    let sse = concat!(
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Ready.\"}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+        "data: [DONE]\n\n"
+    );
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse),
+        )
+        .mount(&server)
+        .await;
+
+    let temp = tempdir().unwrap();
+    let home = temp.path().join("home");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(home.join(".config/a")).unwrap();
+    fs::create_dir_all(repo.join("src")).unwrap();
+    fs::create_dir_all(repo.join("target")).unwrap();
+    fs::write(repo.join("src/parser.rs"), "MENTIONED_BODY_MUST_NOT_APPEAR").unwrap();
+    fs::write(
+        home.join(".config/a/config.toml"),
+        responses_config(&server.uri()),
+    )
+    .unwrap();
+
+    let socket = format!("a-agent-mention-{}", std::process::id());
+    let session = "a-agent-mention";
+    let started = Command::new("tmux")
+        .args([
+            "-L",
+            &socket,
+            "new-session",
+            "-d",
+            "-x",
+            "90",
+            "-y",
+            "24",
+            "-s",
+            session,
+            "-c",
+            repo.to_str().unwrap(),
+            "-e",
+            &format!("HOME={}", home.display()),
+            "-e",
+            &format!("XDG_STATE_HOME={}", temp.path().join("state").display()),
+            "-e",
+            "TEST_API_KEY=secret",
+            env!("CARGO_BIN_EXE_a"),
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    wait_for_agent_prompt(&socket, session).await;
+    tmux_send_text(&socket, session, "review @s").await;
+    let listing = wait_for_tmux_text(&socket, session, "src/").await;
+    assert!(listing.contains("directory"), "{listing:?}");
+    assert!(!listing.contains("target/"), "{listing:?}");
+    // Tab accepts the directory and re-anchors, so the next list is its contents.
+    tmux_send_key(&socket, session, "Tab").await;
+    wait_for_tmux_text(&socket, session, "review @src/").await;
+    let contents = wait_for_tmux_text(&socket, session, "src/parser.rs").await;
+    assert!(contents.contains("file"), "{contents:?}");
+    tmux_send_key(&socket, session, "Tab").await;
+    wait_for_tmux_text(&socket, session, "review @src/parser.rs").await;
+    tmux_send_key(&socket, session, "Enter").await;
+    wait_for_tmux_text(&socket, session, "Ready.").await;
+
+    let requests = server.received_requests().await.unwrap();
+    let _ = Command::new("tmux")
+        .args(["-L", &socket, "kill-server"])
+        .status()
+        .await;
+    assert_eq!(requests.len(), 1);
+    let body = serde_json::from_slice::<serde_json::Value>(&requests[0].body).unwrap();
+    let content = body["input"][0]["content"].as_str().unwrap();
+    assert!(content.contains("review @src/parser.rs"), "{content}");
+    assert!(
+        content.contains(&format!("- {}", repo.join("src/parser.rs").display())),
+        "the mention should resolve to an absolute target: {content}"
+    );
+    assert!(
+        !content.contains("MENTIONED_BODY_MUST_NOT_APPEAR"),
+        "{content}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rewinding_a_turn_that_wrote_files_asks_before_reverting_them() {
+    if Command::new("tmux")
+        .arg("--version")
+        .output()
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let server = MockServer::start().await;
+    let patch = "*** Begin Patch\n*** Update File: notes.txt\n@@\n-old\n+new\n*** End Patch";
+    let call = serde_json::json!({
+        "type": "function_call",
+        "id": "item_1",
+        "call_id": "call_1",
+        "name": "apply_patch",
+        "arguments": serde_json::to_string(&serde_json::json!({"patch": patch})).unwrap(),
+    });
+    let patch_turn = format!(
+        concat!(
+            "data: {{\"type\":\"response.output_item.added\",\"item\":{call}}}\n\n",
+            "data: {{\"type\":\"response.output_item.done\",\"item\":{call}}}\n\n",
+            "data: {{\"type\":\"response.completed\",\"response\":{{\"usage\":{{\"input_tokens\":2,\"output_tokens\":1}}}}}}\n\n",
+            "data: [DONE]\n\n"
+        ),
+        call = call
+    );
+    let text_turn = concat!(
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"patched\"}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":4,\"output_tokens\":2}}}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let count = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(move |_: &wiremock::Request| {
+            let body = if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                patch_turn.clone()
+            } else {
+                text_turn.to_owned()
+            };
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(body)
+        })
+        .mount(&server)
+        .await;
+
+    let temp = tempdir().unwrap();
+    let home = temp.path().join("home");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(home.join(".config/a")).unwrap();
+    fs::create_dir_all(&repo).unwrap();
+    fs::write(repo.join("notes.txt"), "old\n").unwrap();
+    fs::write(
+        home.join(".config/a/config.toml"),
+        responses_config(&server.uri()),
+    )
+    .unwrap();
+
+    let socket = format!("a-agent-undo-{}", std::process::id());
+    let session = "a-agent-undo";
+    let started = Command::new("tmux")
+        .args([
+            "-L",
+            &socket,
+            "new-session",
+            "-d",
+            "-x",
+            "100",
+            "-y",
+            "30",
+            "-s",
+            session,
+            "-c",
+            repo.to_str().unwrap(),
+            "-e",
+            &format!("HOME={}", home.display()),
+            "-e",
+            &format!("XDG_STATE_HOME={}", temp.path().join("state").display()),
+            "-e",
+            "TEST_API_KEY=secret",
+            env!("CARGO_BIN_EXE_a"),
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    wait_for_agent_prompt(&socket, session).await;
+    tmux_send_text(&socket, session, "edit notes").await;
+    tmux_send_key(&socket, session, "Enter").await;
+    wait_for_tmux_text(&socket, session, "patched").await;
+    assert_eq!(
+        fs::read_to_string(repo.join("notes.txt")).unwrap(),
+        "new\n",
+        "the patch should have been applied"
+    );
+
+    // The plan says what would happen to each file, then one choice covers all
+    // three outcomes.
+    let open_rewind = async |round: usize| {
+        tmux_send_key(&socket, session, "Escape").await;
+        wait_for_tmux_text_count(&socket, session, "Rewind to:", round)
+            .await
+            .unwrap_or_else(|| panic!("rewind selector for round {round}"));
+        tmux_send_key(&socket, session, "Enter").await;
+        wait_for_tmux_text_count(&socket, session, "rewind and revert 1 file", 1)
+            .await
+            .unwrap_or_else(|| panic!("rewind choices for round {round}"))
+    };
+
+    let plan = open_rewind(1).await;
+    assert!(plan.contains("touched 1 file(s)"), "{plan:?}");
+    assert!(plan.contains("restore"), "{plan:?}");
+    assert!(plan.contains("notes.txt"), "{plan:?}");
+    assert!(plan.contains("+1 -1"), "{plan:?}");
+    assert!(plan.contains("rewind the conversation only"), "{plan:?}");
+    assert!(plan.contains("cancel"), "{plan:?}");
+
+    // Cancelling leaves both the files and the conversation alone.
+    tmux_send_key(&socket, session, "Up").await;
+    wait_for_tmux_text(&socket, session, "cancel").await;
+    tmux_send_key(&socket, session, "Enter").await;
+    wait_for_tmux_text(&socket, session, "cancelled").await;
+    let cancelled = tmux_pane(&socket, session).await;
+    assert!(
+        !cancelled.contains("rewound; the previous branch"),
+        "cancel must not rewind: {cancelled:?}"
+    );
+
+    // The conversation-only choice is the default, and it must not touch files.
+    open_rewind(2).await;
+    tmux_send_key(&socket, session, "Enter").await;
+    wait_for_tmux_text(&socket, session, "files left as they are").await;
+    assert_eq!(
+        fs::read_to_string(repo.join("notes.txt")).unwrap(),
+        "new\n",
+        "rewinding the conversation only must not touch the file"
+    );
+
+    // Reverting puts the file back to what it was before the turn.
+    open_rewind(3).await;
+    tmux_send_key(&socket, session, "Down").await;
+    tmux_send_key(&socket, session, "Enter").await;
+    wait_for_tmux_text(&socket, session, "reverted 1 file(s)").await;
+    assert_eq!(
+        fs::read_to_string(repo.join("notes.txt")).unwrap(),
+        "old\n",
+        "reverting should restore the pre-turn contents"
+    );
+
+    // The conversation itself did rewind: rewinding to a prompt keeps that
+    // prompt as the head and drops the work done for it, so the next request
+    // carries the prompt again but none of its tool calls.
+    wait_for_agent_prompt(&socket, session).await;
+    tmux_send_text(&socket, session, "second try").await;
+    tmux_send_key(&socket, session, "Enter").await;
+    wait_for_tmux_text(&socket, session, "patched").await;
+
+    let requests = server.received_requests().await.unwrap();
+    let _ = Command::new("tmux")
+        .args(["-L", &socket, "kill-server"])
+        .status()
+        .await;
+    let last = String::from_utf8(requests.last().unwrap().body.clone()).unwrap();
+    assert!(last.contains("second try"), "{last}");
+    assert!(
+        !last.contains("function_call_output"),
+        "the rewound turn's tool calls should be gone from the request: {last}"
+    );
+    assert!(
+        !last.contains("Begin Patch"),
+        "the rewound turn's patch should be gone from the request: {last}"
+    );
+}
+
 #[tokio::test]
 async fn targets_without_a_prompt_reach_the_first_interactive_turn() {
     if Command::new("tmux")
@@ -1700,6 +2074,205 @@ async fn standalone_input_history_is_shared_and_once_mode_exits_after_response()
         .status()
         .await;
     assert_eq!(requests.len(), 2);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn ctrl_c_discards_the_typed_line_before_it_exits() {
+    if Command::new("tmux").arg("-V").output().await.is_err() {
+        return;
+    }
+    let temp = tempdir().unwrap();
+    let home = temp.path().join("home");
+    let repo = temp.path().join("repo");
+    let state = temp.path().join("state");
+    fs::create_dir_all(home.join(".config/a")).unwrap();
+    fs::create_dir_all(&repo).unwrap();
+    fs::write(
+        home.join(".config/a/config.toml"),
+        responses_config("http://127.0.0.1:1/v1"),
+    )
+    .unwrap();
+
+    let socket = format!("a-abandon-{}", std::process::id());
+    let session = "abandon";
+    let shell = format!(
+        "env HOME={} XDG_STATE_HOME={} bash --noprofile --norc",
+        home.display(),
+        state.display()
+    );
+    assert!(
+        Command::new("tmux")
+            .args([
+                "-L",
+                &socket,
+                "new-session",
+                "-d",
+                "-x",
+                "90",
+                "-y",
+                "24",
+                "-s",
+                session,
+                "-c",
+                repo.to_str().unwrap(),
+                &shell,
+            ])
+            .status()
+            .await
+            .unwrap()
+            .success()
+    );
+    tmux_send_text(&socket, session, env!("CARGO_BIN_EXE_a")).await;
+    tmux_send_key(&socket, session, "Enter").await;
+    wait_for_agent_prompt(&socket, session).await;
+
+    tmux_send_text(&socket, session, "half written thought").await;
+    wait_for_tmux_text(&socket, session, "a> half written thought").await;
+    tmux_send_key(&socket, session, "C-c").await;
+    for _ in 0..40 {
+        if !tmux_pane(&socket, session)
+            .await
+            .contains("half written thought")
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let cleared = tmux_pane(&socket, session).await;
+    assert!(!cleared.contains("half written thought"), "{cleared:?}");
+    assert!(
+        cleared.lines().any(|line| line.starts_with("a>")),
+        "the prompt should still be waiting: {cleared:?}"
+    );
+
+    // Ctrl+Y brings it back, so a mistaken press costs nothing.
+    tmux_send_key(&socket, session, "C-y").await;
+    wait_for_tmux_text(&socket, session, "a> half written thought").await;
+    tmux_send_key(&socket, session, "C-c").await;
+
+    // Only an empty line exits.
+    tmux_send_key(&socket, session, "C-c").await;
+    wait_for_pane_command(&socket, session, "bash").await;
+    let _ = Command::new("tmux")
+        .args(["-L", &socket, "kill-server"])
+        .status()
+        .await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn resizing_the_terminal_does_not_break_a_selector() {
+    if Command::new("tmux").arg("-V").output().await.is_err() {
+        return;
+    }
+    let server = MockServer::start().await;
+    let sse = concat!(
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"answered\"}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+        "data: [DONE]\n\n"
+    );
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse),
+        )
+        .mount(&server)
+        .await;
+
+    let temp = tempdir().unwrap();
+    let home = temp.path().join("home");
+    let repo = temp.path().join("repo");
+    let state = temp.path().join("state");
+    fs::create_dir_all(home.join(".config/a")).unwrap();
+    fs::create_dir_all(&repo).unwrap();
+    fs::write(
+        home.join(".config/a/config.toml"),
+        responses_config(&server.uri()),
+    )
+    .unwrap();
+
+    let socket = format!("a-resize-{}", std::process::id());
+    let session = "resize";
+    let shell = format!(
+        "env HOME={} XDG_STATE_HOME={} bash --noprofile --norc",
+        home.display(),
+        state.display()
+    );
+    assert!(
+        Command::new("tmux")
+            .args([
+                "-L",
+                &socket,
+                "new-session",
+                "-d",
+                "-x",
+                "90",
+                "-y",
+                "24",
+                "-s",
+                session,
+                "-c",
+                repo.to_str().unwrap(),
+                &shell,
+            ])
+            .status()
+            .await
+            .unwrap()
+            .success()
+    );
+    tmux_send_text(&socket, session, env!("CARGO_BIN_EXE_a")).await;
+    tmux_send_key(&socket, session, "Enter").await;
+    wait_for_agent_prompt(&socket, session).await;
+
+    // Running a turn is what installs a SIGWINCH handler for the rest of the
+    // process, so the resize below only interrupts reads after one has happened.
+    tmux_send_text(&socket, session, "hi").await;
+    tmux_send_key(&socket, session, "Enter").await;
+    wait_for_tmux_text(&socket, session, "answered").await;
+
+    // /model opens a selector; a resize while it waits for a key delivers
+    // SIGWINCH, which used to surface as "Interrupted system call" and quit.
+    tmux_send_text(&socket, session, "/model").await;
+    tmux_send_key(&socket, session, "Enter").await;
+    wait_for_tmux_text(&socket, session, "Model").await;
+    for size in ["70", "100"] {
+        assert!(
+            Command::new("tmux")
+                .args([
+                    "-L",
+                    &socket,
+                    "resize-window",
+                    "-t",
+                    session,
+                    "-x",
+                    size,
+                    "-y",
+                    "30",
+                ])
+                .status()
+                .await
+                .unwrap()
+                .success()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    let after_resize = tmux_pane(&socket, session).await;
+    assert!(
+        !after_resize.contains("Interrupted system call"),
+        "a resize must not end the session: {after_resize:?}"
+    );
+
+    // The selector is still live and still usable.
+    tmux_send_key(&socket, session, "Enter").await;
+    wait_for_tmux_text(&socket, session, "model: test").await;
+    wait_for_agent_prompt(&socket, session).await;
+    let _ = Command::new("tmux")
+        .args(["-L", &socket, "kill-server"])
+        .status()
+        .await;
 }
 
 async fn tmux_send_text(socket: &str, session: &str, text: &str) {

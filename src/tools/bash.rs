@@ -14,12 +14,37 @@ use tokio_util::sync::CancellationToken;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BashArgs {
     pub command: String,
+    /// What the model asked for. A build or a full test run needs minutes, while
+    /// most commands need seconds, and only the caller knows which this is.
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
 pub struct BashOptions {
+    /// Used when the call does not ask for a timeout.
     pub timeout: Duration,
+    /// Ceiling for what a call may ask for, so a hung command cannot run
+    /// unbounded.
+    pub max_timeout: Duration,
     pub max_output_bytes: usize,
+}
+
+impl BashOptions {
+    /// The timeout this call runs under, and the requested value if it had to be
+    /// capped. Callers report the cap so the model can see why its request did
+    /// not take effect.
+    fn resolve_timeout(&self, args: &BashArgs) -> (Duration, Option<u64>) {
+        let Some(requested) = args.timeout_seconds.filter(|seconds| *seconds > 0) else {
+            return (self.timeout.min(self.max_timeout), None);
+        };
+        let requested_duration = Duration::from_secs(requested);
+        if requested_duration > self.max_timeout {
+            (self.max_timeout, Some(requested))
+        } else {
+            (requested_duration, None)
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,7 +96,8 @@ pub async fn execute_bash_cancellable(
     tokio::spawn(pump(stdout, tx.clone()));
     tokio::spawn(pump(stderr, tx));
 
-    let deadline = Instant::now() + options.timeout;
+    let (timeout, capped_from) = options.resolve_timeout(args);
+    let deadline = Instant::now() + timeout;
     let mut bounded = BoundedOutput::new(options.max_output_bytes);
     let mut timed_out = false;
     let mut cancelled = false;
@@ -105,10 +131,22 @@ pub async fn execute_bash_cancellable(
 
     let mut output = bounded.finish();
     if timed_out {
+        // Say what the limit was and how to raise it: a bare "timed out" leaves
+        // the model guessing whether the command or the limit was wrong.
         output.push_str(&format!(
-            "\n[bash timed out after {:.1}s]",
-            options.timeout.as_secs_f64()
+            "\n[bash timed out after {:.1}s",
+            timeout.as_secs_f64()
         ));
+        match capped_from {
+            Some(requested) => output.push_str(&format!(
+                "; timeout_seconds {requested} was capped at {}]",
+                options.max_timeout.as_secs()
+            )),
+            None => output.push_str(&format!(
+                "; pass timeout_seconds up to {} for slow commands]",
+                options.max_timeout.as_secs()
+            )),
+        }
     } else if cancelled {
         output.push_str("\n[bash cancelled]");
     }

@@ -81,7 +81,8 @@ command-history context, and the per-shell conversations target Fish.
 - **No indexing, no daemon.** Startup does not scale with repository size;
   resuming a 100-turn conversation reaches the first request in about 15 ms.
 - **Three tools.** `read`, `apply_patch`, `bash`. Independent calls run in
-  parallel; patches touching the same file are serialized.
+  parallel; patches touching the same file are serialized. A `bash` call can
+  raise its own timeout for a release build or a full test run.
 - **Resumable and reversible.** SQLite sessions, `Esc` to rewind to an earlier
   message, compaction anchored on the token usage the provider reported.
 - **Any provider.** Anthropic Messages, OpenAI Responses, and OpenAI-compatible
@@ -153,9 +154,17 @@ a --session a_SESSION_ID "continue"
 ```
 
 `-1` exits after one complete user turn, including all model and tool cycles.
-Target files are sent as paths and read only if the model calls `read`. Piped
-stdin is bounded and keeps the tail. Interactive `a` defaults to multi-turn
-mode; `Tab` switches between `multi · tab` and `once · tab`.
+Target files are sent as paths and read only if the model calls `read`.
+Interactive `a` defaults to multi-turn mode; `Tab` switches between
+`multi · tab` and `once · tab`.
+
+Piped stdin is bounded and keeps the tail, so `cargo test 2>&1 | a "fix this"`
+sends the useful end of a long log. Only a pipe or a redirected file counts as
+input: a supervisor that hands its child a socket is not piping anything, and
+reading that would block forever. A real pipe is read to end of file however
+long the producer takes. Like any program that reads stdin, `a` inside a
+`while read` loop would consume the rest of that loop's input; redirect it there
+with `a ... < /dev/null`.
 
 Interactive commands:
 
@@ -175,10 +184,37 @@ given no argument. Model, effort, and reasoning visibility persist with the
 session and are restored on resume. `/resume` only offers sessions from the
 current directory.
 
+Typing `@` anywhere in the prompt completes a path from the current directory:
+`Up`/`Down` cycle the matches, `Tab` accepts one, and accepting a directory
+lists it so the next `Tab` descends. Only one directory is read per keystroke,
+and `.git`, `node_modules`, and `target` are skipped. A mentioned path is sent
+as a target for that turn, exactly like a path given on the command line, so the
+file is still only read if the model calls `read`.
+
 When a model profile sets `context_window`, `a` compacts automatically near
 `context_window - max_tokens`. Usage comes from the token counts the provider
 reports, so no extra API call is made; only messages newer than the last report
 are estimated locally.
+
+`/status` also reports what the session has cost. Prices come from
+[models.dev](https://models.dev), fetched only when `/status` runs and then
+cached for a day, so startup never pays for it. A model id that several
+providers price differently is not guessed at: `/status` names the candidates
+and the line to add, because a plausible but wrong number is worse than none.
+
+```toml
+[models.deepseek]
+pricing = "deepseek/deepseek-v4-flash"   # a models.dev provider/model key
+
+[models.deepseek.cost]                   # or state the prices yourself,
+input = 0.14                             # in USD per million tokens
+output = 0.28
+cache_read = 0.0028
+```
+
+Explicit `cost` wins and needs no network. `A_PRICING_URL` points the lookup at
+a mirror. The total covers every request the session made, including ones on
+branches a rewind left behind.
 
 ## Context
 
@@ -219,7 +255,30 @@ notice, so a later resume does not silently continue the cancelled task.
 - `Esc` or `Ctrl+C` during a turn: cancel it
 - `Ctrl+O`: toggle reasoning visibility, configurable as
   `ui.reasoning_toggle = "ctrl-r"`
-- `Ctrl+C` at the prompt: exit
+- `Ctrl+C` at the prompt: discard the typed line, or exit when it is already
+  empty. `Ctrl+Y` puts a discarded line back
+
+Every `apply_patch` prints its own hunks, so what was written is visible without
+opening the file. Long patches are cut at `ui.patch_diff_max_lines` (24).
+
+`bash` runs under `tools.bash_timeout_seconds` (120) unless the call asks for
+longer, which it should for release builds, dependency installs, and full test
+runs. Requests are capped at `tools.bash_max_timeout_seconds` (1800), and a
+raised limit is shown next to the command so a long-running step does not look
+like a hang. A timeout reports both the limit that applied and the ceiling, so
+the retry can ask for enough time.
+
+Rewinding can put the files back too. It first lists what it would do to each
+file — `delete` for one created after that point, `restore` with line counts for
+one that was edited, `recreate` for one that was deleted — and then offers three
+choices: rewind the conversation only, rewind and revert the files, or cancel.
+
+A file the agent touched several times counts once, reverting to its state at the
+rewind point. A file that changed since the agent last wrote it is marked `keep`
+and left alone, so a rewind never discards an edit of yours; so is one whose
+previous contents exceeded `session.snapshot_max_bytes` (1 MiB), which is
+reported rather than half-restored. There is no separate `/undo`: rewinding to
+the most recent message is the same operation.
 
 ## Fish
 
@@ -227,7 +286,8 @@ notice, so a later resume does not silently continue the cancelled task.
 source that file in an already-running shell.
 
 `Ctrl+G` opens the `a> ` prompt. `Ctrl+G` again returns your text to the normal
-Fish editor on the same line; `Ctrl+C` cancels the line. `Tab` switches between
+Fish editor on the same line; `Ctrl+C` clears the line and cancels on an empty
+one. `Tab` switches between
 `once · tab` and `multi · tab`, and the choice lasts for the life of that Fish
 process.
 

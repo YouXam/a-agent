@@ -1,11 +1,12 @@
 use std::fs;
 use std::path::Path;
 
-use a_agent::config::{Config, ProviderKind};
+use a_agent::config::{Config, ProviderKind, Rates};
 use a_agent::context::{
     ContextInput, SkillMetadata, bound_stdin, build_system_prompt, discover_agents,
     discover_skills, parse_skill_metadata, skill_roots,
 };
+use a_agent::pricing;
 use tempfile::tempdir;
 
 #[test]
@@ -159,6 +160,40 @@ context_window = 4096
     let error = Config::load_from(&cwd, &home).unwrap_err().to_string();
     assert!(error.contains("context_window"), "{error}");
     assert!(error.contains("max_tokens"), "{error}");
+}
+
+#[test]
+fn the_bash_timeout_ceiling_defaults_high_and_cannot_sit_below_the_default() {
+    let temp = tempdir().unwrap();
+    let home = temp.path().join("home");
+    let cwd = temp.path().join("repo");
+    fs::create_dir_all(home.join(".config/a")).unwrap();
+    fs::create_dir_all(&cwd).unwrap();
+    let base = r#"
+default_model = "test"
+[providers.test]
+type = "responses"
+api_key = "secret"
+[models.test]
+provider = "test"
+model = "test-model"
+"#;
+    fs::write(home.join(".config/a/config.toml"), base).unwrap();
+    let config = Config::load_from(&cwd, &home).unwrap();
+    assert_eq!(config.tools.bash_timeout_seconds, 120);
+    assert!(
+        config.tools.bash_max_timeout_seconds >= config.tools.bash_timeout_seconds,
+        "a call must be able to ask for at least the default"
+    );
+
+    fs::write(
+        home.join(".config/a/config.toml"),
+        format!("{base}\n[tools]\nbash_timeout_seconds = 300\nbash_max_timeout_seconds = 60\n"),
+    )
+    .unwrap();
+    let error = Config::load_from(&cwd, &home).unwrap_err().to_string();
+    assert!(error.contains("bash_max_timeout_seconds"), "{error}");
+    assert!(error.contains("bash_timeout_seconds"), "{error}");
 }
 
 #[test]
@@ -396,4 +431,242 @@ fn system_prompt_has_active_rules_and_skill_references_only() {
     assert!(prompt.contains("Rust runtime injects recent records"));
     assert!(prompt.contains("integration lacks context injection"));
     assert!(!prompt.contains("SECRET BODY"));
+}
+
+fn pricing_catalog() -> String {
+    serde_json::json!({
+        "deepseek": {
+            "models": {
+                "shared-model": { "cost": { "input": 0.14, "output": 0.28, "cache_read": 0.0028 } },
+                "only-here": { "cost": { "input": 1.0, "output": 2.0 } },
+            "tiered": {
+                "cost": {
+                    "input": 5.0,
+                    "output": 30.0,
+                    "cache_read": 0.5,
+                    "tiers": [
+                        {
+                            "input": 10.0,
+                            "output": 45.0,
+                            "cache_read": 1.0,
+                            "tier": { "type": "context", "size": 200000 }
+                        }
+                    ]
+                }
+            },
+                "no-prices": {}
+            }
+        },
+        "mirror": {
+            "models": {
+                "shared-model": { "cost": { "input": 0.0, "output": 0.0 } }
+            }
+        }
+    })
+    .to_string()
+}
+
+#[test]
+fn a_unique_model_id_resolves_but_an_ambiguous_one_is_reported() {
+    let catalog = pricing_catalog();
+
+    let unique = pricing::resolve_from_catalog(&catalog, "only-here", None);
+    assert_eq!(
+        unique,
+        pricing::Resolution::Known {
+            schedule: pricing::Schedule::flat(Rates {
+                input: 1.0,
+                output: 2.0,
+                cache_read: 0.0,
+                cache_write: 0.0
+            }),
+            source: "deepseek/only-here".into()
+        }
+    );
+
+    // Mirrors price the same id differently, so guessing one would show a
+    // plausible but wrong number.
+    match pricing::resolve_from_catalog(&catalog, "shared-model", None) {
+        pricing::Resolution::Ambiguous { model, providers } => {
+            assert_eq!(model, "shared-model");
+            assert_eq!(providers, vec!["deepseek".to_owned(), "mirror".to_owned()]);
+        }
+        other => panic!("expected ambiguity, got {other:?}"),
+    }
+
+    // An explicit key resolves the ambiguity.
+    let keyed =
+        pricing::resolve_from_catalog(&catalog, "shared-model", Some("mirror/shared-model"));
+    assert!(
+        matches!(&keyed, pricing::Resolution::Known { schedule, .. } if schedule.base.input == 0.0),
+        "{keyed:?}"
+    );
+
+    for (model, key, reason) in [
+        ("no-prices", None, "lists no prices"),
+        ("missing", None, "was not found"),
+        (
+            "shared-model",
+            Some("deepseek"),
+            "must look like provider/model",
+        ),
+    ] {
+        match pricing::resolve_from_catalog(&catalog, model, key) {
+            pricing::Resolution::Unknown(message) => {
+                assert!(message.contains(reason), "{message}");
+            }
+            other => panic!("expected Unknown for {model}, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn cost_uses_each_token_class_at_its_own_rate() {
+    let rates = Rates {
+        input: 1.0,
+        output: 10.0,
+        cache_read: 0.1,
+        cache_write: 2.0,
+    };
+    let usage = a_agent::model::Usage {
+        input_tokens: Some(1_000_000),
+        output_tokens: Some(1_000_000),
+        cached_tokens: Some(1_000_000),
+        cache_write_tokens: Some(1_000_000),
+        total_tokens: Some(4_000_000),
+    };
+    // total_tokens must not be double counted on top of the parts.
+    assert!((pricing::request_cost(usage, rates) - 13.1).abs() < 1e-9);
+    assert_eq!(pricing::format_cost(0.0005), "$0.0005");
+    assert_eq!(pricing::format_cost(1.5), "$1.50");
+}
+
+#[test]
+fn a_session_the_provider_never_metered_is_not_priced_at_zero() {
+    let schedule = pricing::Schedule::flat(Rates {
+        input: 0.14,
+        output: 0.28,
+        cache_read: 0.0028,
+        cache_write: 0.0,
+    });
+    let blank = a_agent::model::Usage {
+        input_tokens: Some(0),
+        output_tokens: Some(0),
+        cached_tokens: None,
+        cache_write_tokens: None,
+        total_tokens: Some(0),
+    };
+    // A gateway that omits usage leaves nothing to price, and claiming a
+    // measured near-zero spend would be wrong.
+    assert!(!pricing::has_measured_usage(&[]));
+    assert!(!pricing::has_measured_usage(&[blank]));
+    assert!(pricing::has_measured_usage(&[a_agent::model::Usage {
+        input_tokens: Some(1),
+        ..blank
+    }]));
+
+    // f64's Sum identity is -0.0, so an unpriced session used to render as a
+    // negative amount.
+    assert_eq!(
+        pricing::format_cost(pricing::session_cost(&[], &schedule)),
+        "$0.00"
+    );
+    assert_eq!(pricing::format_cost(-0.0), "$0.00");
+}
+
+#[test]
+fn explicit_costs_and_a_pricing_key_are_read_from_the_model_profile() {
+    let temp = tempdir().unwrap();
+    let home = temp.path().join("home");
+    let cwd = temp.path().join("repo");
+    fs::create_dir_all(home.join(".config/a")).unwrap();
+    fs::create_dir_all(&cwd).unwrap();
+    fs::write(
+        home.join(".config/a/config.toml"),
+        r#"
+default_model = "priced"
+[providers.gateway]
+type = "responses"
+api_key = "secret"
+[models.priced]
+provider = "gateway"
+model = "shared-model"
+pricing = "deepseek/shared-model"
+[models.priced.cost]
+input = 0.5
+output = 1.5
+"#,
+    )
+    .unwrap();
+
+    let config = Config::load_from(&cwd, &home).unwrap();
+    let selection = config.resolve_model(None, None).unwrap();
+    assert_eq!(selection.pricing.as_deref(), Some("deepseek/shared-model"));
+    let cost = selection.cost.expect("explicit rates");
+    assert_eq!(cost.input, 0.5);
+    assert_eq!(cost.output, 1.5);
+    assert_eq!(cost.cache_read, 0.0);
+}
+
+#[test]
+fn a_tiered_schedule_prices_each_request_by_its_own_size() {
+    let catalog = pricing_catalog();
+    let pricing::Resolution::Known { schedule, .. } =
+        pricing::resolve_from_catalog(&catalog, "tiered", None)
+    else {
+        panic!("expected tiered rates");
+    };
+    assert!(schedule.is_tiered());
+    assert_eq!(schedule.rates_for(199_999).input, 5.0);
+    assert_eq!(schedule.rates_for(200_000).input, 10.0);
+
+    let small = a_agent::model::Usage {
+        input_tokens: Some(100_000),
+        output_tokens: Some(1_000),
+        ..Default::default()
+    };
+    let large = a_agent::model::Usage {
+        input_tokens: Some(150_000),
+        cached_tokens: Some(60_000),
+        output_tokens: Some(1_000),
+        ..Default::default()
+    };
+    // The large request crosses the threshold once cache reads are counted, so
+    // summing the session's tokens first would have priced it at the low tier.
+    let expected = (100_000.0 * 5.0 + 1_000.0 * 30.0) / 1e6
+        + (150_000.0 * 10.0 + 60_000.0 * 1.0 + 1_000.0 * 45.0) / 1e6;
+    let actual = pricing::session_cost(&[small, large], &schedule);
+    assert!((actual - expected).abs() < 1e-9, "{actual} vs {expected}");
+
+    let flat = pricing::Schedule::flat(schedule.base);
+    assert!(!flat.is_tiered());
+    assert!(pricing::session_cost(&[small, large], &flat) < actual);
+}
+
+#[test]
+fn a_long_skill_with_multibyte_text_does_not_break_discovery() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().join(".agents/skills");
+    fs::create_dir_all(root.join("long")).unwrap();
+    fs::create_dir_all(root.join("usable")).unwrap();
+    // Frontmatter, then a body long enough that the metadata read stops
+    // mid-character. Slicing bytes there must not fail the whole startup.
+    let mut long = String::from("---\nname: long\ndescription: A long skill.\n---\n");
+    while long.len() < 9000 {
+        long.push_str("中文说明");
+    }
+    fs::write(root.join("long/SKILL.md"), &long).unwrap();
+    fs::write(
+        root.join("usable/SKILL.md"),
+        "---\nname: usable\ndescription: still discovered\n---\nbody",
+    )
+    .unwrap();
+
+    let skills = discover_skills(std::slice::from_ref(&root)).unwrap();
+    let names = skills
+        .iter()
+        .map(|skill| skill.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, vec!["long", "usable"], "{skills:?}");
+    assert_eq!(skills[0].description, "A long skill.");
 }

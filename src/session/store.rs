@@ -1,12 +1,14 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
 use crate::model::{ContentBlock, ConversationItem, Role, Usage};
+use crate::pricing::Schedule;
+use crate::tools::patch::{FileChange, FileSnapshot};
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS sessions (
@@ -62,6 +64,30 @@ CREATE TABLE IF NOT EXISTS input_history (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     text            TEXT NOT NULL,
     created_at      INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS file_snapshots (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id      TEXT NOT NULL,
+    turn_item_id    TEXT NOT NULL,
+    path            TEXT NOT NULL,
+    change          TEXT NOT NULL,
+    before          TEXT,
+    after_len       INTEGER NOT NULL,
+    after_hash      TEXT NOT NULL,
+    added           INTEGER NOT NULL,
+    removed         INTEGER NOT NULL,
+    restorable      INTEGER NOT NULL,
+    created_at      INTEGER NOT NULL,
+    FOREIGN KEY(session_id) REFERENCES sessions(id)
+);
+CREATE INDEX IF NOT EXISTS idx_snapshots_turn ON file_snapshots(session_id, turn_item_id);
+
+CREATE TABLE IF NOT EXISTS model_prices (
+    key             TEXT PRIMARY KEY,
+    source          TEXT NOT NULL,
+    schedule_json   TEXT NOT NULL,
+    fetched_at      INTEGER NOT NULL
 );
 "#;
 
@@ -482,6 +508,132 @@ impl SessionStore {
         Ok(())
     }
 
+    pub fn record_file_snapshots(
+        &self,
+        session_id: &str,
+        turn_item_id: &str,
+        snapshots: &[FileSnapshot],
+    ) -> Result<()> {
+        let now = now_millis();
+        for snapshot in snapshots {
+            self.connection.execute(
+                "INSERT INTO file_snapshots (session_id, turn_item_id, path, change, before, after_len, after_hash, added, removed, restorable, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    session_id,
+                    turn_item_id,
+                    snapshot.path.to_string_lossy(),
+                    snapshot.change.as_str(),
+                    snapshot.before,
+                    snapshot.after_len as i64,
+                    snapshot.after_hash.to_string(),
+                    snapshot.added as i64,
+                    snapshot.removed as i64,
+                    i64::from(snapshot.restorable),
+                    now
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Snapshots taken from `item_id`'s turn onwards, newest first so a restore
+    /// replays them in reverse order.
+    ///
+    /// Rewinding to a checkpoint means continuing from that message again, so the
+    /// work done in response to it is discarded too, which is why its own turn is
+    /// included rather than only later ones.
+    pub fn snapshots_from_turn(
+        &self,
+        session_id: &str,
+        item_id: &str,
+    ) -> Result<Vec<FileSnapshot>> {
+        let mut statement = self.connection.prepare(
+            "SELECT path, change, before, after_len, after_hash, added, removed, restorable FROM file_snapshots
+             WHERE session_id = ?1 AND created_at >= (
+                 SELECT created_at FROM conversation_items WHERE id = ?2
+             )
+             ORDER BY id DESC",
+        )?;
+        let rows = statement.query_map(params![session_id, item_id], |row| {
+            let change: String = row.get(1)?;
+            let hash: String = row.get(4)?;
+            Ok(FileSnapshot {
+                path: PathBuf::from(row.get::<_, String>(0)?),
+                change: FileChange::parse(&change).unwrap_or(FileChange::Modified),
+                before: row.get(2)?,
+                after_len: row.get::<_, i64>(3)? as u64,
+                after_hash: hash.parse().unwrap_or_default(),
+                added: row.get::<_, i64>(5)? as usize,
+                removed: row.get::<_, i64>(6)? as usize,
+                restorable: row.get::<_, i64>(7)? != 0,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn delete_snapshots_from_turn(&self, session_id: &str, item_id: &str) -> Result<()> {
+        self.connection.execute(
+            "DELETE FROM file_snapshots WHERE session_id = ?1 AND created_at >= (
+                 SELECT created_at FROM conversation_items WHERE id = ?2
+             )",
+            params![session_id, item_id],
+        )?;
+        Ok(())
+    }
+
+    /// Usage of every request the session ever made, one entry per request,
+    /// including requests on branches a rewind left behind: all of them were
+    /// paid for. Kept per request because tiered prices depend on how large that
+    /// individual request was.
+    pub fn session_request_usage(&self, session_id: &str) -> Result<Vec<Usage>> {
+        let mut statement = self.connection.prepare(
+            "SELECT usage_json FROM conversation_items WHERE session_id = ?1 AND usage_json IS NOT NULL ORDER BY created_at ASC, rowid ASC",
+        )?;
+        let rows = statement.query_map([session_id], |row| row.get::<_, String>(0))?;
+        let mut requests = Vec::new();
+        for row in rows {
+            if let Ok(usage) = serde_json::from_str::<Usage>(&row?) {
+                requests.push(usage);
+            }
+        }
+        Ok(requests)
+    }
+
+    /// Cached model prices, ignored once older than `ttl` so a price change is
+    /// picked up without making every `/status` hit the network. The whole
+    /// schedule is stored, tiers included, so a cache hit prices large requests
+    /// the same way a fresh lookup would.
+    pub fn cached_prices(&self, key: &str, ttl: Duration) -> Result<Option<(Schedule, String)>> {
+        let cutoff = now_millis() - ttl.as_millis() as i64;
+        let mut statement = self.connection.prepare(
+            "SELECT source, schedule_json FROM model_prices WHERE key = ?1 AND fetched_at >= ?2",
+        )?;
+        let mut rows = statement.query(params![key, cutoff])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        let source: String = row.get(0)?;
+        let schedule: String = row.get(1)?;
+        let Ok(schedule) = serde_json::from_str::<Schedule>(&schedule) else {
+            return Ok(None);
+        };
+        Ok(Some((schedule, source)))
+    }
+
+    pub fn cache_prices(&self, key: &str, source: &str, schedule: &Schedule) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO model_prices (key, source, schedule_json, fetched_at) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(key) DO UPDATE SET source = excluded.source, schedule_json = excluded.schedule_json, fetched_at = excluded.fetched_at",
+            params![
+                key,
+                source,
+                serde_json::to_string(schedule)?,
+                now_millis()
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn set_provider_state(
         &self,
         session_id: &str,
@@ -582,11 +734,30 @@ fn migrate_schema(connection: &Connection) -> Result<()> {
     ensure_column(connection, "sessions", "effort", "TEXT")?;
     ensure_column(connection, "shell_history", "client_session_key", "TEXT")?;
     ensure_column(connection, "conversation_items", "usage_json", "TEXT")?;
+    // model_prices only caches what models.dev already knows, so a shape change
+    // is cheaper to rebuild than to migrate column by column.
+    rebuild_cache_table(connection, "model_prices", "schedule_json")?;
     connection.execute_batch(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_client_key ON sessions(cwd, client_session_key) WHERE client_session_key IS NOT NULL;
          CREATE INDEX IF NOT EXISTS idx_shell_client_time ON shell_history(cwd, client_session_key, started_at DESC);
          PRAGMA user_version = 4;",
     )?;
+    Ok(())
+}
+
+/// Drops a cache table that predates `expected_column` so the schema statement
+/// can recreate it in its current shape.
+fn rebuild_cache_table(connection: &Connection, table: &str, expected_column: &str) -> Result<()> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if columns.is_empty() || columns.iter().any(|column| column == expected_column) {
+        return Ok(());
+    }
+    drop(statement);
+    connection.execute_batch(&format!("DROP TABLE {table}"))?;
+    connection.execute_batch(SCHEMA)?;
     Ok(())
 }
 

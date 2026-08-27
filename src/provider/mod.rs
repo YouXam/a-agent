@@ -85,7 +85,14 @@ pub(crate) fn tool_definitions() -> Vec<serde_json::Value> {
             "description": "Run a shell command in the current workspace and return bounded stdout, stderr, and exit status.",
             "parameters": {
                 "type": "object",
-                "properties": {"command": {"type": "string"}},
+                "properties": {
+                    "command": {"type": "string"},
+                    "timeout_seconds": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Seconds before the command is killed. Omit for the default, which suits ordinary commands. Set it for work that legitimately takes longer, such as release builds, dependency installs, or a full test run. Requests above the configured ceiling are capped, and a timeout reports both the limit that applied and the ceiling."
+                    }
+                },
                 "required": ["command"],
                 "additionalProperties": false
             }

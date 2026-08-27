@@ -39,6 +39,18 @@ effort = "medium"
 efforts = ["low", "medium", "high", "xhigh", "max"]
 context_window = 1050000
 
+# /status prices a session from models.dev. Set this when several providers list
+# the same model id at different rates; /status names the candidates when so.
+# pricing = "openai/gpt-5.6"
+#
+# Or state the rates yourself, in USD per million tokens. These win over
+# models.dev and need no network.
+# [models.codex.cost]
+# input = 1.25
+# output = 10.0
+# cache_read = 0.125
+# cache_write = 0.0
+
 # Multiple model profiles may share a provider and override request settings.
 # [models.fast]
 # provider = "openai"
@@ -58,9 +70,14 @@ tool_input_max_bytes = 2048
 tool_output_max_bytes = 8192
 tool_output_max_lines = 16
 tool_live_output_lines = 6
+# Hunk lines shown per apply_patch call.
+patch_diff_max_lines = 24
 
 [tools]
+# Default bash timeout. A call that expects to be slow can ask for more, up to
+# bash_max_timeout_seconds, so this stays short without blocking long builds.
 bash_timeout_seconds = 120
+bash_max_timeout_seconds = 1800
 max_parallel = 8
 max_output_bytes = 65536
 
@@ -73,3 +90,6 @@ read_max_lines = 1000
 max_agent_cycles = 50
 shell_history_limit = 5000
 input_history_limit = 1000
+# Largest previous file contents kept so a rewind can offer to restore them.
+# Anything larger is reported as unrestorable instead of half-restored.
+snapshot_max_bytes = 1048576

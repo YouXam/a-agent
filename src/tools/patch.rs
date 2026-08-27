@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -10,6 +10,9 @@ use super::path::unrestricted_path;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PatchSummary {
     pub files: Vec<PatchFileSummary>,
+    /// What each touched file looked like beforehand, so the change can be
+    /// undone. Absent for files too large to keep in the session.
+    pub snapshots: Vec<FileSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,6 +20,165 @@ pub struct PatchFileSummary {
     pub path: String,
     pub added: usize,
     pub removed: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileChange {
+    Added,
+    Modified,
+    Deleted,
+}
+
+impl FileChange {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Added => "added",
+            Self::Modified => "modified",
+            Self::Deleted => "deleted",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "added" => Some(Self::Added),
+            "modified" => Some(Self::Modified),
+            "deleted" => Some(Self::Deleted),
+            _ => None,
+        }
+    }
+}
+
+/// One file as it was before a patch touched it, with a fingerprint of what the
+/// patch left behind so a later restore can tell whether anything else has
+/// changed the file since.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileSnapshot {
+    pub path: PathBuf,
+    pub change: FileChange,
+    pub before: Option<String>,
+    pub after_len: u64,
+    pub after_hash: u64,
+    pub added: usize,
+    pub removed: usize,
+    /// False when the previous contents were too large to keep, which is
+    /// reported rather than silently truncated.
+    pub restorable: bool,
+}
+
+/// Collapses a rewind range into one entry per path, describing the whole range
+/// rather than each patch in it.
+///
+/// A path the agent touched more than once has one snapshot per patch, and each
+/// one's `after_*` describes only that patch. Checking them individually calls
+/// every snapshot but the last "changed after the agent wrote it", which is both
+/// useless and untrue — the agent's own later edit is what changed it. What
+/// matters is the state at the start of the range and the state the agent last
+/// left the file in.
+///
+/// `newest_first` must be ordered newest to oldest, as the store returns it.
+pub fn coalesce_snapshots(newest_first: Vec<FileSnapshot>) -> Vec<FileSnapshot> {
+    let mut order = Vec::new();
+    let mut grouped: BTreeMap<PathBuf, (FileSnapshot, FileSnapshot)> = BTreeMap::new();
+    for snapshot in newest_first {
+        match grouped.get_mut(&snapshot.path) {
+            // Later iterations are older, so this becomes the start of the range.
+            Some((oldest, _)) => {
+                oldest.added += snapshot.added;
+                oldest.removed += snapshot.removed;
+                let added = oldest.added;
+                let removed = oldest.removed;
+                *oldest = FileSnapshot {
+                    added,
+                    removed,
+                    ..snapshot
+                };
+            }
+            None => {
+                order.push(snapshot.path.clone());
+                grouped.insert(snapshot.path.clone(), (snapshot.clone(), snapshot));
+            }
+        }
+    }
+
+    let mut coalesced = Vec::new();
+    for path in order {
+        let Some((oldest, newest)) = grouped.remove(&path) else {
+            continue;
+        };
+        let existed_before = oldest.change != FileChange::Added;
+        let exists_after = newest.change != FileChange::Deleted;
+        let change = match (existed_before, exists_after) {
+            // Created and then removed again: the range left nothing behind.
+            (false, false) => continue,
+            (false, true) => FileChange::Added,
+            (true, false) => FileChange::Deleted,
+            (true, true) => FileChange::Modified,
+        };
+        coalesced.push(FileSnapshot {
+            change,
+            after_len: newest.after_len,
+            after_hash: newest.after_hash,
+            ..oldest
+        });
+    }
+    coalesced
+}
+
+impl FileSnapshot {
+    /// Why this snapshot cannot be put back, or `None` when it can. A file the
+    /// agent wrote and something else then edited is left alone: reverting it
+    /// would throw away the other edit.
+    pub fn restore_blocker(&self) -> Option<String> {
+        if !self.restorable {
+            return Some("the previous contents were too large to keep".into());
+        }
+        let current = std::fs::read_to_string(&self.path);
+        match self.change {
+            FileChange::Deleted => match current {
+                Ok(_) => Some("something recreated this file".into()),
+                Err(_) => None,
+            },
+            FileChange::Added | FileChange::Modified => match current {
+                Ok(current)
+                    if current.len() as u64 == self.after_len
+                        && content_hash(&current) == self.after_hash =>
+                {
+                    None
+                }
+                Ok(_) => Some("changed since the agent last wrote it".into()),
+                Err(error) => Some(format!("unreadable: {error}")),
+            },
+        }
+    }
+
+    /// Puts the file back as it was. Callers are expected to have checked
+    /// [`Self::restore_blocker`] first.
+    pub fn restore(&self) -> Result<()> {
+        match self.change {
+            FileChange::Added => std::fs::remove_file(&self.path)
+                .with_context(|| format!("remove {}", self.path.display())),
+            FileChange::Modified | FileChange::Deleted => {
+                let before = self
+                    .before
+                    .as_deref()
+                    .context("snapshot kept no previous contents")?;
+                if let Some(parent) = self.path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&self.path, before)
+                    .with_context(|| format!("write {}", self.path.display()))
+            }
+        }
+    }
+}
+
+/// Cheap content fingerprint. Only ever compared against another fingerprint
+/// this program produced, so a non-cryptographic hash is enough.
+pub fn content_hash(content: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    content.hash(&mut hasher);
+    hasher.finish()
 }
 
 #[derive(Debug)]
@@ -48,10 +210,12 @@ enum Prepared {
     Update {
         path: PathBuf,
         content: String,
+        before: String,
         summary: PatchFileSummary,
     },
     Delete {
         path: PathBuf,
+        before: String,
         summary: PatchFileSummary,
     },
 }
@@ -76,6 +240,17 @@ pub fn affected_paths(patch: &str) -> Result<Vec<String>> {
 }
 
 pub async fn apply_patch(root: &Path, patch: &str) -> Result<PatchSummary> {
+    apply_patch_with_snapshots(root, patch, usize::MAX).await
+}
+
+/// `snapshot_max_bytes` caps how much of a file's previous contents is kept for
+/// undo; anything larger is recorded as unrestorable instead of truncated, since
+/// a partial restore would corrupt the file.
+pub async fn apply_patch_with_snapshots(
+    root: &Path,
+    patch: &str,
+    snapshot_max_bytes: usize,
+) -> Result<PatchSummary> {
     let operations = parse_patch(patch)?;
     let mut prepared = Vec::with_capacity(operations.len());
     let mut seen = BTreeSet::new();
@@ -116,6 +291,7 @@ pub async fn apply_patch(root: &Path, patch: &str) -> Result<PatchSummary> {
                         added: 0,
                         removed: source.lines().count(),
                     },
+                    before: source,
                 });
             }
             Operation::Update { path, hunks } => {
@@ -126,6 +302,7 @@ pub async fn apply_patch(root: &Path, patch: &str) -> Result<PatchSummary> {
                 prepared.push(Prepared::Update {
                     path: resolved,
                     content,
+                    before: source,
                     summary: PatchFileSummary {
                         path,
                         added,
@@ -137,6 +314,11 @@ pub async fn apply_patch(root: &Path, patch: &str) -> Result<PatchSummary> {
     }
 
     let mut summaries = Vec::new();
+    let mut snapshots = Vec::new();
+    let keep = |before: String| {
+        let restorable = before.len() <= snapshot_max_bytes;
+        (restorable.then_some(before), restorable)
+    };
     for operation in prepared {
         match operation {
             Prepared::Add {
@@ -160,11 +342,22 @@ pub async fn apply_patch(root: &Path, patch: &str) -> Result<PatchSummary> {
                     return Err(error)
                         .with_context(|| format!("write new file {}", path.display()));
                 }
+                snapshots.push(FileSnapshot {
+                    path: path.clone(),
+                    change: FileChange::Added,
+                    before: None,
+                    after_len: content.len() as u64,
+                    after_hash: content_hash(&content),
+                    added: summary.added,
+                    removed: summary.removed,
+                    restorable: true,
+                });
                 summaries.push(summary);
             }
             Prepared::Update {
                 path,
                 content,
+                before,
                 summary,
             } => {
                 let mut file = OpenOptions::new()
@@ -174,15 +367,44 @@ pub async fn apply_patch(root: &Path, patch: &str) -> Result<PatchSummary> {
                     .with_context(|| format!("open {} for update", path.display()))?;
                 file.write_all(content.as_bytes())?;
                 file.sync_all()?;
+                let (before, restorable) = keep(before);
+                snapshots.push(FileSnapshot {
+                    path: path.clone(),
+                    change: FileChange::Modified,
+                    before,
+                    after_len: content.len() as u64,
+                    after_hash: content_hash(&content),
+                    added: summary.added,
+                    removed: summary.removed,
+                    restorable,
+                });
                 summaries.push(summary);
             }
-            Prepared::Delete { path, summary } => {
+            Prepared::Delete {
+                path,
+                before,
+                summary,
+            } => {
                 fs::remove_file(&path).with_context(|| format!("delete {}", path.display()))?;
+                let (before, restorable) = keep(before);
+                snapshots.push(FileSnapshot {
+                    path: path.clone(),
+                    change: FileChange::Deleted,
+                    before,
+                    after_len: 0,
+                    after_hash: content_hash(""),
+                    added: summary.added,
+                    removed: summary.removed,
+                    restorable,
+                });
                 summaries.push(summary);
             }
         }
     }
-    Ok(PatchSummary { files: summaries })
+    Ok(PatchSummary {
+        files: summaries,
+        snapshots,
+    })
 }
 
 fn parse_patch(patch: &str) -> Result<Vec<Operation>> {

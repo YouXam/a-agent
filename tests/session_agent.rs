@@ -6,7 +6,8 @@ use a_agent::provider::{EventSink, Provider};
 use a_agent::session::{
     CONVERSATION_SUMMARY_PREFIX, NewSession, SessionStore, TURN_INTERRUPTED_NOTICE,
 };
-use a_agent::tools::runner::{ToolExecutor, ToolRunner};
+use a_agent::tools::patch::{FileChange, FileSnapshot, content_hash};
+use a_agent::tools::runner::{ToolExecutor, ToolOutcome, ToolRunner};
 use async_trait::async_trait;
 use rusqlite::Connection;
 use tempfile::tempdir;
@@ -467,8 +468,8 @@ struct FakeTools;
 
 #[async_trait]
 impl ToolExecutor for FakeTools {
-    async fn execute(&self, call: ToolCall) -> ToolResult {
-        ToolResult::success(call.id, "1: code")
+    async fn execute(&self, call: ToolCall) -> ToolOutcome {
+        ToolResult::success(call.id, "1: code").into()
     }
 }
 
@@ -834,4 +835,109 @@ fn is_summary(blocks: &[ContentBlock]) -> bool {
     blocks.iter().any(
         |block| matches!(block, ContentBlock::Text(text) if text.starts_with(CONVERSATION_SUMMARY_PREFIX)),
     )
+}
+
+#[test]
+fn snapshots_belong_to_their_turn_and_only_later_turns_are_restorable() {
+    let mut store = SessionStore::open_in_memory().unwrap();
+    let session = store
+        .create_session(NewSession::new("/repo", "responses", "test-model"))
+        .unwrap();
+
+    let first = store
+        .append_item(
+            &session.id,
+            Role::User,
+            vec![ContentBlock::Text("first".into())],
+        )
+        .unwrap();
+    store
+        .record_file_snapshots(
+            &session.id,
+            &first.id,
+            &[FileSnapshot {
+                path: "/repo/early.rs".into(),
+                change: FileChange::Modified,
+                before: Some("early before\n".into()),
+                after_len: 5,
+                after_hash: content_hash("early"),
+                added: 1,
+                removed: 1,
+                restorable: true,
+            }],
+        )
+        .unwrap();
+
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    let second = store
+        .append_item(
+            &session.id,
+            Role::User,
+            vec![ContentBlock::Text("second".into())],
+        )
+        .unwrap();
+    store
+        .record_file_snapshots(
+            &session.id,
+            &second.id,
+            &[
+                FileSnapshot {
+                    path: "/repo/late.rs".into(),
+                    change: FileChange::Added,
+                    before: None,
+                    after_len: 4,
+                    after_hash: content_hash("late"),
+                    added: 1,
+                    removed: 0,
+                    restorable: true,
+                },
+                FileSnapshot {
+                    path: "/repo/huge.rs".into(),
+                    change: FileChange::Modified,
+                    before: None,
+                    after_len: 99,
+                    after_hash: content_hash("huge"),
+                    added: 1,
+                    removed: 1,
+                    restorable: false,
+                },
+            ],
+        )
+        .unwrap();
+
+    // Rewinding to the second turn offers that turn's own changes, so redoing it
+    // starts from the same files, while the first turn's change stays applied.
+    let after_second = store.snapshots_from_turn(&session.id, &second.id).unwrap();
+    let paths = after_second
+        .iter()
+        .map(|snapshot| snapshot.path.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(paths, vec!["/repo/huge.rs", "/repo/late.rs"], "{paths:?}");
+    assert!(!after_second[0].restorable, "the oversized file is flagged");
+
+    // Rewinding to the first turn offers everything the agent wrote since.
+    let after_first = store.snapshots_from_turn(&session.id, &first.id).unwrap();
+    assert_eq!(after_first.len(), 3);
+    let early = after_first
+        .iter()
+        .find(|snapshot| snapshot.path.ends_with("early.rs"))
+        .unwrap();
+    assert_eq!(early.before.as_deref(), Some("early before\n"));
+
+    store
+        .delete_snapshots_from_turn(&session.id, &second.id)
+        .unwrap();
+    assert!(
+        store
+            .snapshots_from_turn(&session.id, &second.id)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .snapshots_from_turn(&session.id, &first.id)
+            .unwrap()
+            .len(),
+        1
+    );
 }

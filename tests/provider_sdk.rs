@@ -119,7 +119,17 @@ async fn responses_sdk_honors_custom_base_headers_and_streams() {
 
     let requests = server.received_requests().await.unwrap();
     let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
-    assert_eq!(body["tools"].as_array().unwrap().len(), 3);
+    let tools = body["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 3);
+    // A slow command has to be able to ask for more time than the default.
+    let bash = tools
+        .iter()
+        .find(|tool| tool["name"] == "bash")
+        .expect("bash tool");
+    assert_eq!(
+        bash["parameters"]["properties"]["timeout_seconds"]["type"],
+        "integer"
+    );
 }
 
 #[tokio::test]

@@ -13,19 +13,37 @@ use crate::model::{StreamEvent, ToolCall, ToolResult};
 use crate::provider::EventSink;
 
 use super::bash::{BashArgs, BashOptions, OutputSink, execute_bash_cancellable};
-use super::patch::{affected_paths, apply_patch};
+use super::patch::{FileSnapshot, affected_paths, apply_patch_with_snapshots};
 use super::read::{ReadArgs, read_text_file_bounded};
+
+/// A tool result plus anything the harness needs that must not be shown to the
+/// model. `ToolResult::output` goes into the conversation, so file snapshots
+/// travel beside it rather than inside it.
+#[derive(Debug, Clone)]
+pub struct ToolOutcome {
+    pub result: ToolResult,
+    pub snapshots: Vec<FileSnapshot>,
+}
+
+impl From<ToolResult> for ToolOutcome {
+    fn from(result: ToolResult) -> Self {
+        Self {
+            result,
+            snapshots: Vec::new(),
+        }
+    }
+}
 
 #[async_trait]
 pub trait ToolExecutor: Send + Sync {
-    async fn execute(&self, call: ToolCall) -> ToolResult;
+    async fn execute(&self, call: ToolCall) -> ToolOutcome;
 
     async fn execute_with(
         &self,
         call: ToolCall,
         _events: EventSink,
         _cancel: CancellationToken,
-    ) -> ToolResult {
+    ) -> ToolOutcome {
         self.execute(call).await
     }
 }
@@ -34,6 +52,7 @@ pub struct CoreToolExecutor {
     cwd: PathBuf,
     read_max_lines: usize,
     max_output_bytes: usize,
+    snapshot_max_bytes: usize,
     bash_options: BashOptions,
 }
 
@@ -44,14 +63,32 @@ impl CoreToolExecutor {
         bash_timeout: Duration,
         max_output_bytes: usize,
     ) -> Self {
+        Self::with_snapshot_limit(
+            cwd,
+            read_max_lines,
+            BashOptions {
+                timeout: bash_timeout,
+                max_timeout: bash_timeout,
+                max_output_bytes,
+            },
+            max_output_bytes,
+            1024 * 1024,
+        )
+    }
+
+    pub fn with_snapshot_limit(
+        cwd: PathBuf,
+        read_max_lines: usize,
+        bash_options: BashOptions,
+        max_output_bytes: usize,
+        snapshot_max_bytes: usize,
+    ) -> Self {
         Self {
             cwd,
             read_max_lines,
             max_output_bytes,
-            bash_options: BashOptions {
-                timeout: bash_timeout,
-                max_output_bytes,
-            },
+            snapshot_max_bytes,
+            bash_options,
         }
     }
 }
@@ -63,7 +100,7 @@ struct PatchArgs {
 
 #[async_trait]
 impl ToolExecutor for CoreToolExecutor {
-    async fn execute(&self, call: ToolCall) -> ToolResult {
+    async fn execute(&self, call: ToolCall) -> ToolOutcome {
         self.execute_with(call, EventSink::default(), CancellationToken::new())
             .await
     }
@@ -73,11 +110,12 @@ impl ToolExecutor for CoreToolExecutor {
         call: ToolCall,
         events: EventSink,
         cancel: CancellationToken,
-    ) -> ToolResult {
+    ) -> ToolOutcome {
         if cancel.is_cancelled() {
-            return ToolResult::error(call.id, "tool execution cancelled");
+            return ToolResult::error(call.id, "tool execution cancelled").into();
         }
         let call_id = call.id.clone();
+        let mut snapshots = Vec::new();
         let result = match call.name.as_str() {
             "read" => match serde_json::from_str::<ReadArgs>(&call.arguments) {
                 Ok(args) => {
@@ -92,14 +130,19 @@ impl ToolExecutor for CoreToolExecutor {
                 Err(error) => Err(error.into()),
             },
             "apply_patch" => match patch_text(&call.arguments) {
-                Ok(patch) => apply_patch(&self.cwd, &patch).await.map(|summary| {
-                    summary
-                        .files
-                        .iter()
-                        .map(|file| format!("{} (+{} -{})", file.path, file.added, file.removed))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                }),
+                Ok(patch) => apply_patch_with_snapshots(&self.cwd, &patch, self.snapshot_max_bytes)
+                    .await
+                    .map(|summary| {
+                        snapshots = summary.snapshots;
+                        summary
+                            .files
+                            .iter()
+                            .map(|file| {
+                                format!("{} (+{} -{})", file.path, file.added, file.removed)
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    }),
                 Err(error) => Err(error),
             },
             "bash" => match serde_json::from_str::<BashArgs>(&call.arguments) {
@@ -136,7 +179,7 @@ impl ToolExecutor for CoreToolExecutor {
                 "unknown tool '{name}'; available tools: read, apply_patch, bash"
             )),
         };
-        match result {
+        let result = match result {
             Ok(output)
                 if call.name == "bash"
                     && (output.contains("[bash cancelled]")
@@ -146,7 +189,8 @@ impl ToolExecutor for CoreToolExecutor {
             }
             Ok(output) => ToolResult::success(call.id, output),
             Err(error) => ToolResult::error(call.id, error.to_string()),
-        }
+        };
+        ToolOutcome { result, snapshots }
     }
 }
 
@@ -165,7 +209,7 @@ impl ToolRunner {
         }
     }
 
-    pub async fn execute(&self, calls: Vec<ToolCall>) -> Vec<ToolResult> {
+    pub async fn execute(&self, calls: Vec<ToolCall>) -> Vec<ToolOutcome> {
         self.execute_with(calls, EventSink::default(), CancellationToken::new())
             .await
     }
@@ -175,7 +219,7 @@ impl ToolRunner {
         calls: Vec<ToolCall>,
         events: EventSink,
         cancel: CancellationToken,
-    ) -> Vec<ToolResult> {
+    ) -> Vec<ToolOutcome> {
         let futures = calls.into_iter().map(|call| {
             let executor = self.executor.clone();
             let semaphore = self.semaphore.clone();

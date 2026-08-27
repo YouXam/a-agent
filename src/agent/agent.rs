@@ -80,14 +80,18 @@ impl Agent {
     ) -> Result<AgentResult> {
         self.compact_if_needed(Some(prompt), &events, &cancel)
             .await?;
-        self.store
+        // File snapshots are keyed by the turn that produced them, so a rewind to
+        // this checkpoint knows exactly which changes came after it.
+        let turn_item_id = self
+            .store
             .lock()
             .map_err(|_| anyhow::anyhow!("session store lock poisoned"))?
             .append_item(
                 &self.session_id,
                 Role::User,
                 vec![ContentBlock::Text(prompt.into())],
-            )?;
+            )?
+            .id;
 
         for cycle in 1..=self.max_cycles {
             if cancel.is_cancelled() {
@@ -143,7 +147,18 @@ impl Agent {
                 .tools
                 .execute_with(turn.tool_calls, events.clone(), cancel.clone())
                 .await;
-            for result in results {
+            for outcome in results {
+                let result = outcome.result;
+                if !outcome.snapshots.is_empty() {
+                    self.store
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("session store lock poisoned"))?
+                        .record_file_snapshots(
+                            &self.session_id,
+                            &turn_item_id,
+                            &outcome.snapshots,
+                        )?;
+                }
                 events.emit(StreamEvent::ToolExecutionEnd {
                     id: result.call_id.clone(),
                     result: result.clone(),

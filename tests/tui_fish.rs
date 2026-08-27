@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use a_agent::fish::{fish_script, install_to};
 use a_agent::model::{ContentBlock, ConversationItem, Role, StreamEvent, ToolCall, ToolResult};
-use a_agent::tui::{InlineRenderer, InputEditor, RenderLimits};
+use a_agent::tui::{InlineRenderer, InputEditor, RenderLimits, RevertLine};
 use crossterm::event::{KeyCode, KeyModifiers};
 use tokio::process::Command;
 
@@ -205,6 +205,80 @@ fn apply_patch_renders_file_operations_and_diff_summary() {
 }
 
 #[test]
+fn a_rewind_plan_is_colored_and_aligned_by_action() {
+    let writer = SharedWriter::default();
+    let renderer = InlineRenderer::new(writer.clone(), false, true);
+    renderer
+        .render_revert_plan(&[
+            RevertLine {
+                action: "delete".into(),
+                path: "/tmp/foo".into(),
+                detail: "created after this point".into(),
+                blocked: false,
+            },
+            RevertLine {
+                action: "restore".into(),
+                path: "src/lib.rs".into(),
+                detail: "+12 -3".into(),
+                blocked: false,
+            },
+            RevertLine {
+                action: "keep".into(),
+                path: "src/other.rs".into(),
+                detail: "changed since the agent last wrote it".into(),
+                blocked: true,
+            },
+        ])
+        .unwrap();
+    let output = String::from_utf8(writer.bytes()).unwrap();
+    let plain = String::from_utf8(strip_ansi_escapes::strip(output.as_bytes())).unwrap();
+    // The verb column lines up so the paths are readable as a list.
+    assert!(plain.contains("    delete  /tmp/foo"), "{plain}");
+    assert!(plain.contains("    restore src/lib.rs  +12 -3"), "{plain}");
+    assert!(plain.contains("    keep    src/other.rs"), "{plain}");
+    // Deleting is red, restoring is yellow, a skipped file is dim.
+    assert!(output.contains("\x1b[38;5;1m\x1b[1mdelete"), "{output:?}");
+    assert!(output.contains("\x1b[38;5;3m\x1b[1mrestore"), "{output:?}");
+    assert!(output.contains("\x1b[38;5;8m\x1b[1mkeep"), "{output:?}");
+}
+
+#[test]
+fn a_bash_call_that_raised_its_timeout_says_so() {
+    let render = |arguments: serde_json::Value| {
+        let writer = SharedWriter::default();
+        let renderer = InlineRenderer::new(writer.clone(), false, false);
+        let sink = renderer.event_sink();
+        sink.emit(StreamEvent::ToolCallStart {
+            id: "bash-1".into(),
+            name: "bash".into(),
+        });
+        sink.emit(StreamEvent::ToolCallArgsDelta {
+            id: "bash-1".into(),
+            delta: arguments.to_string(),
+        });
+        sink.emit(StreamEvent::ToolCallEnd {
+            id: "bash-1".into(),
+        });
+        sink.emit(StreamEvent::ToolExecutionEnd {
+            id: "bash-1".into(),
+            result: ToolResult::success("bash-1", "built\n[exit code: 0]"),
+        });
+        String::from_utf8(writer.bytes()).unwrap()
+    };
+
+    let raised = render(serde_json::json!({
+        "command": "cargo build --release",
+        "timeout_seconds": 900
+    }));
+    assert!(raised.contains("✓ bash  exit 0 · timeout 900s"), "{raised}");
+
+    // The default needs no annotation.
+    let default = render(serde_json::json!({"command": "ls"}));
+    assert!(default.contains("✓ bash  exit 0"), "{default}");
+    assert!(!default.contains("timeout"), "{default}");
+}
+
+#[test]
 fn failed_apply_patch_reports_failure_instead_of_file_count() {
     let writer = SharedWriter::default();
     let renderer = InlineRenderer::new(writer.clone(), false, false);
@@ -278,6 +352,7 @@ fn tool_input_and_output_are_bounded_with_visible_truncation() {
             tool_output_max_bytes: 48,
             tool_output_max_lines: 2,
             tool_live_output_lines: 2,
+            ..RenderLimits::default()
         },
     );
     let sink = renderer.event_sink();
@@ -809,9 +884,98 @@ fn fish_installer_writes_the_conf_d_asset() {
 
 #[test]
 fn reasoning_toggle_configuration_accepts_ctrl_character_keys() {
-    let editor = InputEditor::with_reasoning_toggle("ctrl-r").unwrap();
+    let editor = InputEditor::with_reasoning_toggle("ctrl-r", ".").unwrap();
     assert!(editor.is_reasoning_toggle(KeyCode::Char('r'), KeyModifiers::CONTROL));
     assert!(!editor.is_reasoning_toggle(KeyCode::Char('o'), KeyModifiers::CONTROL));
-    assert!(InputEditor::with_reasoning_toggle("alt-r").is_err());
-    assert!(InputEditor::with_reasoning_toggle("ctrl-long").is_err());
+    assert!(InputEditor::with_reasoning_toggle("alt-r", ".").is_err());
+    assert!(InputEditor::with_reasoning_toggle("ctrl-long", ".").is_err());
+}
+
+#[test]
+fn replayed_user_messages_hide_request_scaffolding() {
+    let writer = SharedWriter::default();
+    let renderer = InlineRenderer::new(writer.clone(), false, false);
+    let history = vec![ConversationItem {
+        id: "user".into(),
+        session_id: "session".into(),
+        parent_id: None,
+        role: Role::User,
+        blocks: vec![ContentBlock::Text(
+            "Files provided with this request:\n- /repo/src/main.rs\n\ncheck @src/main.rs".into(),
+        )],
+        usage: None,
+        created_at: 0,
+    }];
+
+    renderer.render_resumed_history(&history).unwrap();
+    let plain = String::from_utf8(writer.bytes()).unwrap();
+    assert!(plain.contains("› check @src/main.rs"), "{plain}");
+    assert!(
+        !plain.contains("Files provided with this request"),
+        "{plain}"
+    );
+    assert!(!plain.contains("/repo/src/main.rs"), "{plain}");
+}
+
+#[test]
+fn apply_patch_shows_the_hunks_it_applied() {
+    let writer = SharedWriter::default();
+    let renderer = InlineRenderer::new_with_limits(
+        writer.clone(),
+        false,
+        true,
+        RenderLimits {
+            patch_diff_max_lines: 4,
+            ..RenderLimits::default()
+        },
+    );
+    let sink = renderer.event_sink();
+    sink.emit(StreamEvent::ToolCallStart {
+        id: "p".into(),
+        name: "apply_patch".into(),
+    });
+    sink.emit(StreamEvent::ToolCallArgsDelta {
+        id: "p".into(),
+        delta: serde_json::json!({
+            "patch": "*** Begin Patch\n*** Update File: src/slug.rs\n@@ fn slug\n-    title.replace(' ', \"-\")\n+    title.to_lowercase()\n+        .replace(' ', \"-\")\n     other\n+    extra one\n+    extra two\n*** End Patch"
+        })
+        .to_string(),
+    });
+    sink.emit(StreamEvent::ToolCallEnd { id: "p".into() });
+    sink.emit(StreamEvent::ToolExecutionEnd {
+        id: "p".into(),
+        result: ToolResult::success("p", "src/slug.rs (+4 -1)"),
+    });
+
+    let bytes = writer.bytes();
+    let plain = String::from_utf8(strip_ansi_escapes::strip(&bytes)).unwrap();
+    assert!(plain.contains("✓ apply_patch  1 files  +4 -1"), "{plain}");
+    assert!(
+        plain.lines().any(|line| line == "  M src/slug.rs"),
+        "{plain}"
+    );
+    // The patch text is the diff that was applied, so it is shown as-is.
+    assert!(
+        plain.lines().any(|line| line == "    @@ fn slug"),
+        "{plain}"
+    );
+    assert!(
+        plain
+            .lines()
+            .any(|line| line == "    -    title.replace(' ', \"-\")"),
+        "{plain}"
+    );
+    assert!(
+        plain
+            .lines()
+            .any(|line| line == "    +    title.to_lowercase()"),
+        "{plain}"
+    );
+    // Bounded by patch_diff_max_lines, with the cut made visible.
+    assert!(plain.contains("… diff truncated"), "{plain}");
+    assert!(!plain.contains("extra two"), "{plain}");
+    // Added and removed lines are coloured differently from context.
+    let colored = String::from_utf8(bytes).unwrap();
+    assert!(colored.contains("\x1b[38;5;2m    +"), "{colored:?}");
+    assert!(colored.contains("\x1b[38;5;1m    -"), "{colored:?}");
 }
