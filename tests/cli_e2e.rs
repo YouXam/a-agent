@@ -1120,11 +1120,23 @@ async fn rewinding_a_turn_that_wrote_files_asks_before_reverting_them() {
     // prompt as the head and drops the work done for it, so the next request
     // carries the prompt again but none of its tool calls.
     wait_for_agent_prompt(&socket, session).await;
+    let before = server.received_requests().await.unwrap().len();
     tmux_send_text(&socket, session, "second try").await;
     tmux_send_key(&socket, session, "Enter").await;
-    wait_for_tmux_text(&socket, session, "patched").await;
+    // Waiting for "patched" on screen would match the first turn's reply, which
+    // is still visible, so wait for the request itself to arrive.
+    for _ in 0..400 {
+        if server.received_requests().await.unwrap().len() > before {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
 
     let requests = server.received_requests().await.unwrap();
+    assert!(
+        requests.len() > before,
+        "the turn after the rewind never reached the provider"
+    );
     let _ = Command::new("tmux")
         .args(["-L", &socket, "kill-server"])
         .status()
