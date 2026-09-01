@@ -10,7 +10,7 @@ end
 
 function __a_preexec --on-event fish_preexec
     set -g __a_command $argv[1]
-    set -g __a_cwd $PWD
+    set -g __a_cwd (pwd -P)
     set -g __a_started_at (date +%s%3N)
 end
 
