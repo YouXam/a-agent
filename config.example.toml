@@ -87,7 +87,6 @@ stdin_max_bytes = 131072
 read_max_lines = 1000
 
 [session]
-max_agent_cycles = 50
 shell_history_limit = 5000
 input_history_limit = 1000
 # Largest previous file contents kept so a rewind can offer to restore them.

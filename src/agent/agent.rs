@@ -14,7 +14,6 @@ pub struct Agent {
     store: Arc<Mutex<SessionStore>>,
     session_id: String,
     system_prompt: String,
-    max_cycles: usize,
     context_window: Option<u64>,
     max_output_tokens: u64,
 }
@@ -48,7 +47,6 @@ impl Agent {
         store: Arc<Mutex<SessionStore>>,
         session_id: String,
         system_prompt: String,
-        max_cycles: usize,
     ) -> Self {
         Self {
             provider,
@@ -56,7 +54,6 @@ impl Agent {
             store,
             session_id,
             system_prompt,
-            max_cycles,
             context_window: None,
             max_output_tokens: 0,
         }
@@ -93,7 +90,9 @@ impl Agent {
             )?
             .id;
 
-        for cycle in 1..=self.max_cycles {
+        let mut cycle = 0;
+        loop {
+            cycle += 1;
             if cancel.is_cancelled() {
                 anyhow::bail!("agent turn cancelled");
             }
@@ -173,11 +172,6 @@ impl Agent {
                     )?;
             }
         }
-        Err(anyhow::anyhow!(
-            "maximum agent cycles ({}) exceeded",
-            self.max_cycles
-        ))
-        .context("maximum agent cycles reached before a final response")
     }
 
     async fn compact_if_needed(

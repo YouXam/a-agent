@@ -210,7 +210,6 @@ impl Default for ContextConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SessionConfig {
-    pub max_agent_cycles: usize,
     pub shell_history_limit: usize,
     pub input_history_limit: usize,
     /// How much of a file's previous contents to keep so a rewind can restore
@@ -221,7 +220,6 @@ pub struct SessionConfig {
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
-            max_agent_cycles: 50,
             shell_history_limit: 5000,
             input_history_limit: 1000,
             snapshot_max_bytes: 1024 * 1024,

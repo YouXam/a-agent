@@ -144,7 +144,6 @@ pub async fn run() -> Result<i32> {
         store.clone(),
         &session.id,
         &system_prompt,
-        config.session.max_agent_cycles,
     )?;
     let renderer = InlineRenderer::stdout_with_limits(
         config.ui.show_reasoning,
@@ -183,7 +182,6 @@ pub async fn run() -> Result<i32> {
                     store.clone(),
                     &session.id,
                     &system_prompt,
-                    config.session.max_agent_cycles,
                 )?;
             }
             SlashAction::Compact => {
@@ -204,7 +202,6 @@ pub async fn run() -> Result<i32> {
                     store.clone(),
                     &session.id,
                     &system_prompt,
-                    config.session.max_agent_cycles,
                 )?;
                 render_session_history(&renderer, &store, &session.id)?;
             }
@@ -264,7 +261,6 @@ pub async fn run() -> Result<i32> {
                             store.clone(),
                             &session.id,
                             &system_prompt,
-                            config.session.max_agent_cycles,
                         )?;
                     }
                     SlashAction::Compact => {
@@ -285,7 +281,6 @@ pub async fn run() -> Result<i32> {
                             store.clone(),
                             &session.id,
                             &system_prompt,
-                            config.session.max_agent_cycles,
                         )?;
                         render_session_history(&renderer, &store, &session.id)?;
                     }
@@ -537,7 +532,6 @@ fn build_agent(
     store: Arc<Mutex<SessionStore>>,
     session_id: &str,
     system_prompt: &str,
-    max_cycles: usize,
 ) -> Result<Agent> {
     Ok(Agent::new(
         create_provider(selection.provider.clone())?,
@@ -545,7 +539,6 @@ fn build_agent(
         store,
         session_id.into(),
         system_prompt.into(),
-        max_cycles,
     )
     .with_context_budget(
         selection.context_window,

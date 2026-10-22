@@ -495,7 +495,6 @@ async fn one_logical_turn_runs_tools_until_final_response() {
         store.clone(),
         session.id.clone(),
         "system".into(),
-        10,
     );
     let events = Arc::new(Mutex::new(Vec::new()));
     let captured_events = events.clone();
@@ -578,7 +577,6 @@ async fn auto_compaction_uses_persisted_provider_usage_as_its_token_anchor() {
         store.clone(),
         session.id.clone(),
         "system".into(),
-        10,
     )
     .with_context_budget(Some(100), 20);
 
@@ -656,7 +654,6 @@ async fn auto_compaction_does_not_reestimate_history_before_a_valid_usage_anchor
         store.clone(),
         session.id.clone(),
         "system".into(),
-        10,
     )
     .with_context_budget(Some(100), 20);
 
@@ -721,7 +718,7 @@ fn context_status_combines_provider_usage_with_trailing_estimates() {
         turns: Mutex::new(Vec::new()),
         request_count: AtomicCounter::default(),
     });
-    let agent = Agent::new(provider, tools, store, session.id, "system".into(), 10)
+    let agent = Agent::new(provider, tools, store, session.id, "system".into())
         .with_context_budget(Some(1000), 100);
 
     let status = agent.context_status().unwrap();
@@ -763,7 +760,6 @@ async fn auto_compaction_ignores_all_zero_usage() {
         store.clone(),
         session.id.clone(),
         "system".into(),
-        10,
     )
     .with_context_budget(Some(100), 20);
 
@@ -810,7 +806,6 @@ async fn manual_compaction_replaces_the_active_branch_without_an_agent_turn() {
         store.clone(),
         session.id.clone(),
         "system".into(),
-        10,
     );
 
     assert!(
